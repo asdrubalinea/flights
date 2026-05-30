@@ -19,6 +19,11 @@ use super::app::App;
 
 const RING_FRACTIONS: [f64; 3] = [1.0 / 3.0, 2.0 / 3.0, 1.0];
 
+/// Terminal character cells are roughly twice as tall as they are wide. The
+/// radar corrects for this so equal range means equal screen distance from Home
+/// in every direction — otherwise the range rings render as ovals.
+const CELL_ASPECT: f64 = 2.0;
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let now = Instant::now();
     // One dead-reckoning pass feeds the whole frame, so the radar, list, and
@@ -74,10 +79,23 @@ fn draw_radar(
     pacing_hex: Option<String>,
     selected_hex: Option<String>,
 ) {
+    // The canvas maps each axis's data range across the pane independently, so
+    // equal bounds in a non-square pane stretch circles into ovals. We widen the
+    // longer pixel axis's bounds to compensate: the shorter axis keeps `radius`
+    // (its outer ring touches the edge) and the longer axis gains empty scope.
+    let inner_w = area.width.saturating_sub(2).max(1) as f64;
+    let inner_h = area.height.saturating_sub(2).max(1) as f64;
+    let pixel_aspect = inner_w / inner_h / CELL_ASPECT; // pane width:height in pixels
+    let (x_extent, y_extent) = if pixel_aspect >= 1.0 {
+        (radius * pixel_aspect, radius)
+    } else {
+        (radius, radius / pixel_aspect)
+    };
+
     let canvas = Canvas::default()
         .block(Block::bordered().title(" radar · north-up "))
-        .x_bounds([-radius, radius])
-        .y_bounds([-radius, radius])
+        .x_bounds([-x_extent, x_extent])
+        .y_bounds([-y_extent, y_extent])
         .marker(Marker::Braille)
         .paint(move |ctx| {
             // Range rings and faint cardinal cross-hairs.
@@ -91,17 +109,17 @@ fn draw_radar(
             }
             let cross = Color::Rgb(40, 40, 40);
             ctx.draw(&CanvasLine {
-                x1: -radius,
+                x1: -x_extent,
                 y1: 0.0,
-                x2: radius,
+                x2: x_extent,
                 y2: 0.0,
                 color: cross,
             });
             ctx.draw(&CanvasLine {
                 x1: 0.0,
-                y1: -radius,
+                y1: -y_extent,
                 x2: 0.0,
-                y2: radius,
+                y2: y_extent,
                 color: cross,
             });
             ctx.layer();
