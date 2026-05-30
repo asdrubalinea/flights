@@ -2,7 +2,7 @@
 name = "flights"
 version = "0.1.0"
 edition = "2021"
-description = "A Rust project"
+description = "Nearest-flight radar TUI with adaptive ADS-B polling"
 license = "MIT"
 
 [[bin]]
@@ -16,3 +16,10 @@ codegen-units = 1
 panic = "abort"
 
 [dependencies]
+ureq = { version = "3", features = ["json"] }   # rustls+gzip default; sync, no Tokio
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ratatui = "0.30"                                 # crossterm backend re-exported at ratatui::crossterm
+toml = "0.9"
+anyhow = "1"                                     # app-level errors
+thiserror = "2"                                  # SourceError + config errors
