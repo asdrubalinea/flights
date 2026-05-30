@@ -70,9 +70,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         app.selected_hex.as_deref(),
     );
 
-    // The flight-detail popup layers over the dimmed radar+list.
+    // The flight-detail popup layers over the dimmed radar+list. Clone the
+    // selection so the scroll offset can be borrowed mutably for clamping.
     if app.mode == Mode::Detail {
-        draw_detail(frame, tracks, app.selected_hex.as_deref(), app.detail_scroll);
+        let selected = app.selected_hex.clone();
+        draw_detail(frame, tracks, selected.as_deref(), &mut app.detail_scroll);
     }
 }
 
@@ -245,35 +247,48 @@ fn list_row(t: &Track, pacing_hex: Option<&str>, max_width: u16) -> Line<'static
         None => ("·", Color::DarkGray, String::new()),
     };
 
-    // (priority, span): when the row can't fit, the highest-priority-number spans
-    // are dropped first. Kept spans render in this (display) order. Keep, in order:
+    // (priority, group): when the row can't fit, the highest-priority-number
+    // groups are dropped whole, lowest-priority (highest number) first. A group is
+    // one or more spans kept or dropped together — the altitude and its trend glyph
+    // share a group so the glyph never shows orphaned, and likewise the CPA arrow
+    // and its text. Kept groups render in this (display) order. Keep, in order:
     // callsign, distance/bearing, altitude+glyph, groundspeed, type, then CPA.
-    let spans = vec![
-        (0, Span::styled(format!("{:<8}", label(&t.flight)), ident_style)),
+    let groups = vec![
+        (
+            0,
+            vec![Span::styled(format!("{:<8}", label(&t.flight)), ident_style)],
+        ),
         (
             4,
-            Span::styled(format!(" {kind:<4}"), Style::new().fg(Color::DarkGray)),
+            vec![Span::styled(
+                format!(" {kind:<4}"),
+                Style::new().fg(Color::DarkGray),
+            )],
         ),
         (
             1,
-            Span::raw(format!(
+            vec![Span::raw(format!(
                 " {:>5.1}nm {:03.0}°",
                 t.distance_nm, t.bearing_from_home
-            )),
+            ))],
         ),
-        (2, Span::raw(format!(" {alt:>7}"))),
         (
             2,
-            Span::styled(glyph.to_string(), Style::new().fg(glyph_color)),
+            vec![
+                Span::raw(format!(" {alt:>7}")),
+                Span::styled(glyph.to_string(), Style::new().fg(glyph_color)),
+            ],
         ),
-        (3, gs_span),
+        (3, vec![gs_span]),
         (
             5,
-            Span::styled(format!(" {arrow} "), Style::new().fg(arrow_color)),
+            vec![
+                Span::styled(format!(" {arrow} "), Style::new().fg(arrow_color)),
+                Span::raw(cpa),
+            ],
         ),
-        (5, Span::raw(cpa)),
     ];
-    fit_spans(spans, max_width)
+    fit_groups(groups, max_width)
 }
 
 /// The list glyph and colour for a vertical trend. Unknown renders blank rather
@@ -287,26 +302,29 @@ fn trend_glyph(trend: VerticalTrend) -> (&'static str, Color) {
     }
 }
 
-/// Assemble row spans to fit `max` columns. Each span carries a priority; when the
-/// full row is too wide, spans are dropped lowest-priority (highest number) first.
-/// Whatever survives renders in the original order, so the row degrades gracefully
-/// on a narrow terminal instead of clipping its rightmost (newest) data.
-fn fit_spans(spans: Vec<(u8, Span<'static>)>, max: u16) -> Line<'static> {
-    let mut keep = vec![false; spans.len()];
+/// Assemble row groups to fit `max` columns. Each group carries a priority and one
+/// or more spans kept or dropped together; when the full row is too wide, groups
+/// are dropped lowest-priority (highest number) first. Whatever survives renders in
+/// the original order, so the row degrades gracefully on a narrow terminal instead
+/// of clipping its rightmost (newest) data — and a multi-span group (altitude +
+/// glyph, arrow + CPA) never half-survives.
+fn fit_groups(groups: Vec<(u8, Vec<Span<'static>>)>, max: u16) -> Line<'static> {
+    let mut keep = vec![false; groups.len()];
     let mut used = 0u16;
-    let mut by_priority: Vec<usize> = (0..spans.len()).collect();
-    by_priority.sort_by_key(|&i| spans[i].0);
+    let mut by_priority: Vec<usize> = (0..groups.len()).collect();
+    by_priority.sort_by_key(|&i| groups[i].0);
     for i in by_priority {
-        let w = spans[i].1.width() as u16;
+        let w: u16 = groups[i].1.iter().map(|s| s.width() as u16).sum();
         if used.saturating_add(w) <= max {
             keep[i] = true;
             used = used.saturating_add(w);
         }
     }
-    let kept: Vec<Span<'static>> = spans
+    let kept: Vec<Span<'static>> = groups
         .into_iter()
         .enumerate()
-        .filter_map(|(i, (_, s))| keep[i].then_some(s))
+        .filter(|(i, _)| keep[*i])
+        .flat_map(|(_, (_, spans))| spans)
         .collect();
     Line::from(kept)
 }
@@ -409,8 +427,9 @@ fn draw_status(
 
 /// The flight-detail popup: dim the frame, clear a centered box, and fill it with
 /// the inspected flight's data — or a "left the area" notice if it has dropped out
-/// of the Search area while the popup was open (never fabricated values).
-fn draw_detail(frame: &mut Frame, tracks: &[Track], selected_hex: Option<&str>, scroll: u16) {
+/// of the Search area while the popup was open (never fabricated values). The key
+/// hints sit on a fixed bottom line so scrolling the body never loses them.
+fn draw_detail(frame: &mut Frame, tracks: &[Track], selected_hex: Option<&str>, scroll: &mut u16) {
     let full = frame.area();
     frame
         .buffer_mut()
@@ -419,29 +438,48 @@ fn draw_detail(frame: &mut Frame, tracks: &[Track], selected_hex: Option<&str>, 
     let area = centered_rect(full, 64, 80, 78, 32);
     frame.render_widget(Clear, area);
 
+    let block = Block::bordered().title(" flight detail ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Reserve the bottom line of the popup for the always-visible key hints; the
+    // flight data scrolls in the space above it.
+    let [body_area, footer_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+
     let track = selected_hex.and_then(|h| tracks.iter().find(|t| t.flight.hex == h));
-    let lines = match track {
-        Some(t) => detail_lines(t),
-        None => vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "  — flight left the area —",
-                Style::new().fg(Color::DarkGray),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  Esc close · ↑/↓ next flight",
-                Style::new().fg(Color::DarkGray),
-            )),
-        ],
+    let (body, footer) = match track {
+        Some(t) => (detail_lines(t), "Esc close · ↑/↓ flight · PgUp/PgDn scroll"),
+        None => (
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  — flight left the area —",
+                    Style::new().fg(Color::DarkGray),
+                )),
+            ],
+            "Esc close · ↑/↓ next flight",
+        ),
     };
 
+    // Clamp so the body can't be scrolled entirely past the viewport, leaving a
+    // void below it. Bounds against the logical line count (the detail fields are
+    // short and never wrap at the popup width, so this matches the rendered height).
+    let max_scroll = (body.len() as u16).saturating_sub(body_area.height);
+    *scroll = (*scroll).min(max_scroll);
+
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(Block::bordered().title(" flight detail "))
+        Paragraph::new(body)
             .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
-        area,
+            .scroll((*scroll, 0)),
+        body_area,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            footer,
+            Style::new().fg(Color::DarkGray),
+        ))),
+        footer_area,
     );
 }
 
@@ -521,11 +559,6 @@ fn detail_lines(t: &Track) -> Vec<Line<'static>> {
         }
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  Esc close · ↑/↓ flight · PgUp/PgDn scroll",
-        Style::new().fg(Color::DarkGray),
-    )));
     lines
 }
 
@@ -776,5 +809,45 @@ mod tests {
         // Must not panic; the callsign (highest priority) survives truncation.
         let text = render_to_text(&mut app, 40, 20);
         assert!(text.contains("TIGHTONE"), "callsign should survive");
+    }
+
+    #[test]
+    fn list_row_drops_altitude_and_its_trend_glyph_together() {
+        // `moving` builds a climbing flight (1200 fpm → "↑") at 30000 ft. Altitude
+        // and its glyph share one fit group, so at a width that can't hold the
+        // altitude the glyph must not survive alone — the bug this grouping fixes.
+        let track = Track {
+            flight: moving("aaa111", "TIGHT", LatLon::new(0.05, 0.0), 90.0, 452.0),
+            estimated: LatLon::new(0.05, 0.0),
+            distance_nm: 3.0,
+            bearing_from_home: 90.0,
+            cpa: None,
+            age: Duration::ZERO,
+        };
+        // Fits the callsign (8) and distance/bearing (13) but not the altitude
+        // group (9); a lone 1-col glyph would otherwise sneak in.
+        let line = list_row(&track, None, 22);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("TIGHT"), "callsign survives");
+        assert!(!text.contains("30000"), "altitude is dropped at this width");
+        assert!(
+            !text.contains('↑'),
+            "trend glyph must not survive without its altitude"
+        );
+    }
+
+    #[test]
+    fn fit_groups_drops_whole_groups_keeping_priority_order() {
+        // Three groups; the priority-2 group has two spans and must be kept or
+        // dropped as a unit. At width 8 the two lowest-number priorities fit and
+        // render in original (display) order; the priority-2 group drops whole.
+        let groups = vec![
+            (0u8, vec![Span::raw("aaaa")]),
+            (2, vec![Span::raw("bb"), Span::raw("BB")]),
+            (1, vec![Span::raw("cccc")]),
+        ];
+        let line = fit_groups(groups, 8);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "aaaacccc");
     }
 }
