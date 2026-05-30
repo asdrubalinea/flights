@@ -1,0 +1,18 @@
+[package]
+name = "flights"
+version = "0.1.0"
+edition = "2021"
+description = "A Rust project"
+license = "MIT"
+
+[[bin]]
+name = "flights"
+path = "src/main.rs"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[dependencies]

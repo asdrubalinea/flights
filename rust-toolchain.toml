@@ -1,0 +1,6 @@
+# Pins the Rust toolchain for both the dev shell and the Nix build.
+# `rust-overlay` reads this file via `fromRustupToolchainFile`, and a
+# rustup user outside Nix would get the same toolchain.
+[toolchain]
+channel = "stable"
+components = ["rust-src", "rustfmt", "clippy", "rust-analyzer"]

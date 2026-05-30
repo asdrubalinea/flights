@@ -1,0 +1,9 @@
+# Rust build artifacts
+/target
+
+# Nix build results
+/result
+/result-*
+
+# direnv / nix-direnv cache
+/.direnv
