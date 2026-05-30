@@ -577,6 +577,18 @@ mod tests {
     }
 
     #[test]
+    fn vertical_rate_falls_back_to_geometric() {
+        // No `baro_rate`; only `geom_rate` → the domain carries the geometric rate.
+        let body = r#"{"ac":[
+            {"hex":"ccc","lat":1.0,"lon":2.0,"alt_baro":5000,"geom_rate":-512}
+        ]}"#;
+        let snap = parse_snapshot(body, Instant::now()).unwrap();
+        let f = &snap.flights[0];
+        assert_eq!(f.vertical_rate_fpm, Some(-512.0));
+        assert_eq!(f.vertical_trend(), crate::domain::VerticalTrend::Descend);
+    }
+
+    #[test]
     fn missing_type_and_model_are_none() {
         // A flight with neither `t` nor `desc` (common for uncatalogued craft).
         let body = r#"{"ac":[{"hex":"ddd","lat":1.0,"lon":2.0,"alt_baro":9000}]}"#;
