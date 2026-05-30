@@ -1,13 +1,18 @@
-//! Configuration: where Home is, how big the Search area is, how fast to render,
-//! and which Source to poll. Everything but secrets lives in a TOML file under
-//! `$XDG_CONFIG_HOME/flights/config.toml` (falling back to `~/.config`). API keys
-//! for future paid Sources come from the environment only and are never written
-//! here (the readsb-family Sources are keyless).
+//! Configuration: where Home is, how big the Search area is, which Source to
+//! poll, and where to bind the REST API. Everything but secrets lives in a TOML
+//! file under `$XDG_CONFIG_HOME/flights/config.toml` (falling back to `~/.config`).
+//! API keys for future paid Sources come from the environment only and are never
+//! written here (the readsb-family Sources are keyless).
 //!
-//! All values have defaults, so the app runs out of the box; the only thing worth
-//! setting is `[home]`. Values are validated and gently clamped on load, with the
-//! reasons surfaced as warnings rather than hard failures wherever that is safe.
+//! This is the **Server** config. Render rate is no longer here — fps is a display
+//! concern that moved to the Client with the split (ADR-0005), since the screen is
+//! kept current by re-querying the Server, which costs no Source call.
+//!
+//! All values have defaults, so the Server runs out of the box; the only thing
+//! worth setting is `[home]`. Values are validated and gently clamped on load,
+//! with the reasons surfaced as warnings rather than hard failures where it is safe.
 
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -52,9 +57,9 @@ pub enum ConfigError {
 pub struct Config {
     pub home: Home,
     pub search: Search,
-    pub render: Render,
     pub poll: Poll,
     pub source: Source,
+    pub server: Server,
 }
 
 /// **Home** — the single fixed point all distances are measured from. Defaults to
@@ -94,17 +99,28 @@ impl Default for Search {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+/// Where the REST API listens. Loopback by default — the unauthenticated API is
+/// safe precisely *because* it is bound to `127.0.0.1` (ADR-0005); exposing it
+/// off-machine would require revisiting that.
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct Render {
-    /// Radar/list refresh rate (frames per second). Costs nothing in API calls —
-    /// the screen is kept current by dead reckoning.
-    pub fps: u32,
+pub struct Server {
+    pub bind: String,
+    /// The value sent in `Access-Control-Allow-Origin`, or `None` to send no CORS
+    /// header at all (the default). Loopback only stops the *network* from reaching
+    /// the API; a permissive CORS header additionally lets any website the user
+    /// visits read the responses — including Home's coordinates from `/meta` — via
+    /// a browser `fetch`. So CORS is **off by default** and the future webclient
+    /// opts in to a specific origin (e.g. `"https://flights.example"`) or `"*"`.
+    pub cors_allow_origin: Option<String>,
 }
 
-impl Default for Render {
+impl Default for Server {
     fn default() -> Self {
-        Self { fps: 4 }
+        Self {
+            bind: "127.0.0.1:7878".to_string(),
+            cors_allow_origin: None,
+        }
     }
 }
 
@@ -170,8 +186,10 @@ impl Config {
         }
     }
 
-    pub fn render_interval(&self) -> Duration {
-        Duration::from_secs_f64(1.0 / f64::from(self.render.fps.max(1)))
+    /// The configured bind address, resolved to a concrete socket. Validated on
+    /// load (see [`Config::finalize`]), so this won't error there.
+    pub fn bind_addr(&self) -> Result<SocketAddr, ConfigError> {
+        resolve_bind(&self.server.bind)
     }
 
     pub fn max_poll(&self) -> Duration {
@@ -278,13 +296,18 @@ impl Config {
             self.search.relevance_distance_nm = self.search.radius_nm;
         }
 
-        if !(1..=60).contains(&self.render.fps) {
-            let clamped = self.render.fps.clamp(1, 60);
+        // The bind address must resolve now, so a typo fails on load with a clear
+        // message rather than deep inside server startup.
+        let addr = resolve_bind(&self.server.bind)?;
+        // The no-auth model leans on a loopback bind (ADR-0005). A non-loopback
+        // bind exposes the unauthenticated API — including Home's coordinates — to
+        // the network; allow it (an explicit choice) but never let it pass silently.
+        if !addr.ip().is_loopback() {
             warnings.push(format!(
-                "render.fps {} out of [1, 60]; clamping to {clamped}",
-                self.render.fps
+                "server.bind {} is not loopback; the unauthenticated API (and Home's \
+                 coordinates via /meta) will be reachable from the network",
+                self.server.bind
             ));
-            self.render.fps = clamped;
         }
 
         // The max poll interval must stay below the Search-area transit time, so a
@@ -314,16 +337,20 @@ impl Config {
         format!(
             "Home          {:.4}, {:.4}\n\
              Search area   {:.0} nm radius (relevance {:.0} nm)\n\
-             Render        {} fps\n\
              Poll          max {:.0}s (transit ceiling {:.0}s)\n\
+             Bind          {} (CORS {})\n\
              Source        {}{}",
             self.home.lat,
             self.home.lon,
             self.search.radius_nm,
             self.search.relevance_distance_nm,
-            self.render.fps,
             self.poll.max_interval_secs,
             self.transit_time().as_secs_f64(),
+            self.server.bind,
+            match &self.server.cors_allow_origin {
+                Some(origin) => origin.as_str(),
+                None => "off",
+            },
             self.source.kind,
             match &self.source.base_url {
                 Some(url) => format!(" ({url})"),
@@ -331,6 +358,17 @@ impl Config {
             },
         )
     }
+}
+
+/// Resolve a `host:port` bind string to a concrete [`SocketAddr`], erroring (not
+/// panicking) on a malformed or unresolvable address so config load can report it.
+fn resolve_bind(bind: &str) -> Result<SocketAddr, ConfigError> {
+    bind.to_socket_addrs()
+        .map_err(|e| {
+            ConfigError::Invalid(format!("server.bind {bind:?} is not a valid address: {e}"))
+        })?
+        .next()
+        .ok_or_else(|| ConfigError::Invalid(format!("server.bind {bind:?} resolved to no address")))
 }
 
 #[cfg(test)]
@@ -362,7 +400,7 @@ mod tests {
         assert_eq!(cfg.home.lat, 40.6413);
         assert_eq!(cfg.search.radius_nm, 50.0);
         // Untouched sections fall back to defaults.
-        assert_eq!(cfg.render.fps, 4);
+        assert_eq!(cfg.server.bind, "127.0.0.1:7878");
         assert_eq!(cfg.source.kind, "airplanes_live");
     }
 
@@ -432,5 +470,46 @@ mod tests {
             bogus = true
         "#;
         assert!(toml::from_str::<Config>(toml).is_err());
+    }
+
+    #[test]
+    fn default_bind_resolves_to_loopback() {
+        let cfg = Config::default();
+        let addr = cfg.bind_addr().unwrap();
+        assert!(addr.ip().is_loopback());
+        assert_eq!(addr.port(), 7878);
+    }
+
+    #[test]
+    fn rejects_a_malformed_bind_address() {
+        let cfg = Config {
+            server: Server {
+                bind: "not a socket".into(),
+                ..Server::default()
+            },
+            ..Config::default()
+        };
+        assert!(matches!(cfg.finalize(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn cors_is_off_by_default() {
+        assert_eq!(Config::default().server.cors_allow_origin, None);
+    }
+
+    #[test]
+    fn warns_but_accepts_a_non_loopback_bind() {
+        let cfg = Config {
+            server: Server {
+                bind: "0.0.0.0:7878".into(),
+                ..Server::default()
+            },
+            ..Config::default()
+        };
+        let (_cfg, warnings) = cfg.finalize().unwrap();
+        assert!(
+            warnings.iter().any(|w| w.contains("not loopback")),
+            "a non-loopback bind should warn: {warnings:?}"
+        );
     }
 }

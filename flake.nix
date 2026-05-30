@@ -32,23 +32,27 @@
           rustc = rustToolchain;
         };
 
-        manifest = (pkgs.lib.importTOML ./Cargo.toml).package;
+        # The root manifest is now a virtual workspace; read shared metadata from
+        # [workspace.package] rather than a [package] that no longer exists.
+        workspace = (pkgs.lib.importTOML ./Cargo.toml).workspace;
 
-        # The release binary. `buildRustPackage` builds in release mode.
+        # One derivation builds every workspace member in release mode, so the
+        # output carries both binaries: `flights` (the TUI client) and
+        # `flights-server` (the engine + REST daemon).
         flights = rustPlatform.buildRustPackage {
-          pname = manifest.name;
-          version = manifest.version;
+          pname = "flights";
+          version = workspace.package.version;
           src = pkgs.lib.cleanSource ./.;
           cargoLock.lockFile = ./Cargo.lock;
 
           meta = {
-            description = manifest.description or "A Rust project";
-            mainProgram = manifest.name;
+            description = "Nearest-flight radar: a thick server and a thin TUI client over a local REST API";
+            mainProgram = "flights";
           };
         };
       in
       {
-        # `nix build` / `nix build .#flights` -> ./result/bin/flights
+        # `nix build` / `nix build .#flights` -> ./result/bin/{flights,flights-server}
         packages = {
           default = flights;
           flights = flights;

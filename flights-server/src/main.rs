@@ -1,37 +1,40 @@
-//! `flights` — track the nearest airborne flight to a fixed Home, pacing the
-//! polls itself so it stays within a Source's limits and keeps the screen smooth.
+//! `flights-server` — the long-running engine and HTTP daemon (ADR-0005). It owns
+//! the Source, polls it on its self-chosen cadence (ADR-0002), holds the latest
+//! Snapshot in a shared [`Tracker`], and answers every airspace question over a
+//! small loopback REST API. Thin Clients (the TUI, the waybar module) only render
+//! what it computes; none of them touch a Source.
 //!
 //! Entry point: load config, read any Source secret from the environment, build
-//! the Source, spawn the poller, and run the chosen mode (TUI by default).
+//! the Source, spawn the poller onto a shared `Arc<RwLock<Tracker>>`, and serve
+//! the REST API. `--once`/`--print-config` are headless smoke modes.
 
+mod api;
 mod config;
 mod domain;
 mod geo;
+mod http;
 mod poller;
 mod sources;
 mod tracker;
-mod ui;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::mpsc;
-use std::time::Instant;
+use std::sync::{Arc, RwLock};
 
 use config::Config;
 use domain::Flight;
-use poller::{PollBounds, PollUpdate};
+use poller::PollBounds;
 use sources::FlightSource;
 use tracker::{Track, Tracker, TrackerConfig};
 
 const USAGE: &str = "\
-flights — nearest-flight radar
+flights-server — nearest-flight engine + REST API
 
 USAGE:
-    flights [OPTIONS]
+    flights-server [OPTIONS]
 
 OPTIONS:
-    --tui              Run the radar TUI (default)
-    --headless         Run the poller and print snapshots + chosen cadence
+    --serve            Poll the Source and serve the REST API (default)
     --once             Fetch a single snapshot, print nearest/pacing, exit
     --print-config     Print the resolved config and exit
     --config <PATH>    Use an explicit config file
@@ -42,8 +45,7 @@ Set [home] lat/lon to your location; everything else has sensible defaults.";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Mode {
-    Tui,
-    Headless,
+    Serve,
     Once,
     PrintConfig,
     Help,
@@ -60,8 +62,7 @@ fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let new_mode = match arg.as_str() {
-            "--tui" => Some(Mode::Tui),
-            "--headless" => Some(Mode::Headless),
+            "--serve" => Some(Mode::Serve),
             "--once" => Some(Mode::Once),
             "--print-config" => Some(Mode::PrintConfig),
             "-h" | "--help" => Some(Mode::Help),
@@ -82,7 +83,7 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     Ok(Args {
-        mode: mode.unwrap_or(Mode::Tui),
+        mode: mode.unwrap_or(Mode::Serve),
         config_path,
     })
 }
@@ -123,8 +124,7 @@ fn main() -> ExitCode {
             Ok(())
         }
         Mode::Once => run_once(&cfg),
-        Mode::Headless => run_headless(&cfg),
-        Mode::Tui => ui::run(&cfg),
+        Mode::Serve => run_serve(&cfg),
         Mode::Help => unreachable!("handled above"),
     };
 
@@ -159,7 +159,36 @@ fn tracker_cfg(cfg: &Config) -> TrackerConfig {
     }
 }
 
-/// `--once`: one synchronous fetch, printed. Doubles as a live smoke test.
+/// `--serve` (default): build the Source, spawn the poller onto a shared Tracker,
+/// and serve the REST API on the configured bind address. Blocks until killed.
+fn run_serve(cfg: &Config) -> anyhow::Result<()> {
+    let addr = cfg.bind_addr()?;
+    let source = sources::build(cfg)?;
+    let area = cfg.search_area();
+    let bounds = poll_bounds(cfg, &*source);
+    let source_name = source.name().to_string();
+    let meta = api::build_meta(cfg, &source_name);
+
+    // Bind before spawning the poller so a port conflict fails fast and cleanly.
+    let server = http::bind(addr)?;
+
+    eprintln!(
+        "source: {source_name} | poll window {:.2}s–{:.0}s | serving REST API on http://{addr}",
+        bounds.min.as_secs_f64(),
+        bounds.max.as_secs_f64()
+    );
+
+    let tracker = Arc::new(RwLock::new(Tracker::new(area, tracker_cfg(cfg))));
+    // The poller writes the shared Tracker; HTTP handler threads read it. Both
+    // bindings keep their leading-underscore names (not a bare `_`, which would
+    // drop `Shutdown` at once and kill the poller); they live until the blocking
+    // `serve` below returns, i.e. until the process is killed.
+    let (_poller, _shutdown) = poller::spawn(source, area, bounds, Arc::clone(&tracker));
+
+    http::serve(server, tracker, meta, cfg.server.cors_allow_origin.clone())
+}
+
+/// `--once`: one synchronous fetch, printed. A live smoke test of the Source.
 fn run_once(cfg: &Config) -> anyhow::Result<()> {
     let source = sources::build(cfg)?;
     let area = cfg.search_area();
@@ -184,63 +213,6 @@ fn run_once(cfg: &Config) -> anyhow::Result<()> {
         Some(t) => println!("Pacing : {}", fmt_pacing(&t)),
         None => println!("Pacing : (none — airspace quiet)"),
     }
-    Ok(())
-}
-
-/// `--headless`: spawn the poller and print each update with the cadence it
-/// chose, proving the rate/cost behavior before any UI. Runs until interrupted.
-fn run_headless(cfg: &Config) -> anyhow::Result<()> {
-    let source = sources::build(cfg)?;
-    let area = cfg.search_area();
-    let bounds = poll_bounds(cfg, &*source);
-    let tcfg = tracker_cfg(cfg);
-
-    eprintln!(
-        "source: {} | poll window {:.2}s–{:.0}s | Ctrl-C to stop",
-        source.name(),
-        bounds.min.as_secs_f64(),
-        bounds.max.as_secs_f64()
-    );
-
-    let (tx, rx) = mpsc::channel();
-    let (handle, _shutdown) = poller::spawn(source, area, bounds, tcfg, tx);
-    let mut tracker = Tracker::new(area, tcfg);
-    let start = Instant::now();
-
-    for update in rx {
-        let t = start.elapsed().as_secs_f64();
-        match update {
-            PollUpdate::Snapshot {
-                snapshot,
-                next_interval,
-            } => {
-                let now = Instant::now();
-                let count = snapshot.flights.len();
-                tracker.ingest(snapshot);
-                let nearest = tracker
-                    .nearest_at(now)
-                    .map(|t| fmt_position(&t))
-                    .unwrap_or_else(|| "(none)".into());
-                let pacing = tracker
-                    .pacing_at(now)
-                    .map(|t| fmt_pacing(&t))
-                    .unwrap_or_else(|| "(quiet)".into());
-                println!(
-                    "[{t:>7.1}s] {count:>3} flights | nearest {nearest} | pacing {pacing} | next +{:.1}s",
-                    next_interval.as_secs_f64()
-                );
-            }
-            PollUpdate::Error { error, retry_in } => {
-                tracker.note_error(error.to_string());
-                eprintln!(
-                    "[{t:>7.1}s] poll error: {error} | retry +{:.1}s",
-                    retry_in.as_secs_f64()
-                );
-            }
-        }
-    }
-
-    let _ = handle.join();
     Ok(())
 }
 

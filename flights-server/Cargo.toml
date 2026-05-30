@@ -1,0 +1,20 @@
+[package]
+name = "flights-server"
+description = "Nearest-flight engine + adaptive ADS-B poller, served over a small loopback REST API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "flights-server"
+path = "src/main.rs"
+
+[dependencies]
+flights-api = { workspace = true }
+ureq = { workspace = true }       # Source client; rustls+gzip, sync, no Tokio
+tiny_http = { workspace = true }  # sync HTTP server (ADR-0006)
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }     # app-level
+thiserror = { workspace = true }  # SourceError + config errors

@@ -1,25 +1,29 @@
-[package]
-name = "flights"
+[workspace]
+resolver = "2"
+members = ["flights-api", "flights-server", "flights-tui"]
+
+# Shared metadata and dependency versions, so the three crates stay in lockstep
+# (ADR-0005: the wire contract is shared, so the two sides must not drift).
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-description = "Nearest-flight radar TUI with adaptive ADS-B polling"
 license = "MIT"
 
-[[bin]]
-name = "flights"
-path = "src/main.rs"
+[workspace.dependencies]
+flights-api = { path = "flights-api" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3", features = ["json"] }   # rustls+gzip default; sync, no Tokio
+tiny_http = "0.12"                              # sync HTTP server (ADR-0006)
+ratatui = "0.30"                                # crossterm backend re-exported at ratatui::crossterm
+toml = "0.9"
+anyhow = "1"                                    # app-level errors
+thiserror = "2"                                 # SourceError + config errors
 
+# Size-optimized release binaries (profiles only take effect at the workspace
+# root, so the single-crate profile moves here).
 [profile.release]
 strip = true
 lto = true
 codegen-units = 1
 panic = "abort"
-
-[dependencies]
-ureq = { version = "3", features = ["json"] }   # rustls+gzip default; sync, no Tokio
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-ratatui = "0.30"                                 # crossterm backend re-exported at ratatui::crossterm
-toml = "0.9"
-anyhow = "1"                                     # app-level errors
-thiserror = "2"                                  # SourceError + config errors

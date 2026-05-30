@@ -198,8 +198,14 @@ mod tests {
         assert_eq!(with_rate(None).vertical_trend(), VerticalTrend::Unknown);
         assert_eq!(with_rate(Some(0.0)).vertical_trend(), VerticalTrend::Level);
         assert_eq!(with_rate(Some(99.0)).vertical_trend(), VerticalTrend::Level);
-        assert_eq!(with_rate(Some(-99.0)).vertical_trend(), VerticalTrend::Level);
-        assert_eq!(with_rate(Some(100.0)).vertical_trend(), VerticalTrend::Climb);
+        assert_eq!(
+            with_rate(Some(-99.0)).vertical_trend(),
+            VerticalTrend::Level
+        );
+        assert_eq!(
+            with_rate(Some(100.0)).vertical_trend(),
+            VerticalTrend::Climb
+        );
         assert_eq!(
             with_rate(Some(-100.0)).vertical_trend(),
             VerticalTrend::Descend

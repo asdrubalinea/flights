@@ -31,7 +31,11 @@ a `curl | jq` one-liner, and reduces the TUI to a pure renderer.
 The engine lives only in the Server, so there is a single poller and a single Source
 budget — two processes polling a 1-req/s Source would blow it. The API is
 unauthenticated and bound to loopback (`127.0.0.1`), which is what makes "no auth"
-safe; exposing it off-machine would require revisiting that. The wire contract lives
+safe; exposing it off-machine would require revisiting that. Loopback only stops the
+*network*, though — a permissive `Access-Control-Allow-Origin` would additionally let
+any website the user visits read the responses (Home's coordinates from `/meta`
+included) via a browser `fetch`. So CORS is **off by default** and opted into per
+origin (`server.cors_allow_origin`) when the webclient ships. The wire contract lives
 in a serde-only `flights-api` crate shared by both sides, so Clients update in
 lockstep and the API is unversioned until an independently-deployed consumer (a
 hosted webclient) appears.

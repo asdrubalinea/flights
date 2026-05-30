@@ -17,7 +17,7 @@ Blocking I/O, no async runtime — including the HTTP server (sync `tiny_http`,
 ADR-0006). The client/server split rationale is ADR-0005; the hybrid flight-detail
 data model the API carries is ADR-0004.
 
-## REST contract (served on `127.0.0.1:7878`, no auth, CORS `*`)
+## REST contract (served on `127.0.0.1:7878`, no auth, CORS opt-in via `server.cors_allow_origin`)
 
 | Endpoint        | Returns                                                              |
 |-----------------|----------------------------------------------------------------------|
