@@ -1,14 +1,30 @@
 # Flights
 
-A long-running app that tracks the **nearest flight** to a fixed **Home**
+A long-running **Server** that tracks the **nearest flight** to a fixed **Home**
 location using a pluggable **Source** (initially the free, community-run
 airplanes.live ADS-B API), deciding *itself* how often to poll so it stays within
-each Source's limits and keeps the screen smooth. The current build is a radar-style
-TUI — a Home-centered scope showing nearby flights as gliding blips, alongside a
-list of those flights — that you watch directly; the intended eventual use is to
-feed a waybar status-bar widget.
+each Source's limits. It crunches the data once and exposes the result over a
+small, cheap local REST API consumed by thin **Clients**: a radar-style TUI (a
+Home-centered scope of gliding blips beside a list of those flights), a waybar
+status-bar module showing just the nearest flight, and a webclient later. Each
+Client only renders what the Server computes — none of them touch a Source.
 
 ## Language
+
+**Server**:
+The single long-running process that owns the Source, polls it on its self-chosen
+cadence, holds the latest **Snapshot**, and answers every question about the
+airspace — **dead-reckoning** each flight to the *instant of the request*. It is
+the only thing that talks to a Source and the sole source of truth.
+_Avoid_: "backend", "daemon" as domain terms (just "the Server").
+
+**Client**:
+Any consumer of the Server's API that only *renders* — the TUI, the waybar module,
+the future webclient. A Client chooses *what* to show and *how often* to ask, but
+never computes which flight is nearest or where a blip belongs; that is always the
+Server's answer. Whether a flight is close enough to be worth showing is Client
+policy, distinct from **Relevance distance** (which gates the Server's pacing,
+never a Client's display).
 
 **Nearest flight**:
 The airborne flight whose last reported position is the smallest great-circle
@@ -71,6 +87,22 @@ wholesale — flights it omits have left the box. Between Snapshots the app
 dead-reckons the latest one; if polls stop arriving, the current Snapshot is held
 and flagged stale, and individual flights are dropped once they age past a
 staleness cap so the radar never shows fiction indefinitely.
+
+**Track**:
+A single flight as estimated at a particular instant — its **dead-reckoned**
+position plus the geometry derived from it: ground distance and bearing from Home,
+and its **CPA**. A Track is what a Client renders; it is computed *from* the raw
+reported flight inside a **Snapshot**, never the same thing.
+_Note_: "track" is overloaded, as it is in real ATC usage — a *Track* (this term,
+a tracked target) versus *track* the ground heading in degrees (a flight's
+direction of travel). Both senses are kept; context disambiguates.
+
+**Picture**:
+The complete, self-consistent view of the airspace at one instant: every **Track**,
+which one is the **Nearest flight**, which is the **Pacing flight**, and how fresh
+the data is. Derived from a *single* dead-reckoning pass, so the radar, list, and
+status can never disagree — they read one Picture rather than recomputing three
+times. The Server's primary API answer.
 
 **Source** (data source):
 A pluggable provider of flight Snapshots — a free ADS-B API (airplanes.live today;
@@ -168,3 +200,16 @@ adapter — by design they exist only as opaque strings in a detail group (ADR-0
 > **Domain expert:** No — it's just another Source behind the same interface. The
 > poller, tracker, and radar don't notice; you point config at it, and it declares
 > a faster minimum poll interval because there's no rate limit to respect.
+>
+> **Dev:** When the waybar module asks for the nearest flight, does that trigger a
+> Source poll?
+> **Domain expert:** No. The Server polls on its own cadence and holds the latest
+> Snapshot; a Client request just dead-reckons that Snapshot to *now* and answers.
+> Clients are cheap to serve precisely because asking the Server costs no API call —
+> the only thing that ever touches a Source is the Server's own poller.
+>
+> **Dev:** So if the TUI and the waybar module are both open, are we polling
+> airplanes.live twice?
+> **Domain expert:** No — there's one Server and one poller. Both Clients read the
+> same Picture. That's the whole reason the engine lives only in the Server: two
+> processes polling a 1-req/s Source would blow the budget.
