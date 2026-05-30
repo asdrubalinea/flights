@@ -9,13 +9,14 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Circle, Line as CanvasLine, Points};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
+use crate::domain::VerticalTrend;
 use crate::tracker::{Health, Track};
 use crate::{fmt_pacing, fmt_position, label};
 
-use super::app::App;
+use super::app::{App, Mode};
 
 const RING_FRACTIONS: [f64; 3] = [1.0 / 3.0, 2.0 / 3.0, 1.0];
 
@@ -68,6 +69,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         pacing_hex.as_deref(),
         app.selected_hex.as_deref(),
     );
+
+    // The flight-detail popup layers over the dimmed radar+list.
+    if app.mode == Mode::Detail {
+        draw_detail(frame, tracks, app.selected_hex.as_deref(), app.detail_scroll);
+    }
 }
 
 fn draw_radar(
@@ -182,9 +188,12 @@ fn draw_list(
     selected_hex: Option<&str>,
     state: &mut ListState,
 ) {
+    // Reserve the borders (2) and the highlight symbol ("▶ " = 2) from the width
+    // available to each row, so the width-aware fit matches what actually shows.
+    let row_width = area.width.saturating_sub(4);
     let items: Vec<ListItem> = tracks
         .iter()
-        .map(|t| ListItem::new(list_row(t, pacing_hex)))
+        .map(|t| ListItem::new(list_row(t, pacing_hex, row_width)))
         .collect();
     let list = List::new(items)
         .block(Block::bordered().title(format!(" flights · {} ", tracks.len())))
@@ -196,7 +205,7 @@ fn draw_list(
     frame.render_stateful_widget(list, area, state);
 }
 
-fn list_row<'a>(t: &Track, pacing_hex: Option<&str>) -> Line<'a> {
+fn list_row(t: &Track, pacing_hex: Option<&str>, max_width: u16) -> Line<'static> {
     let is_pacing = Some(t.flight.hex.as_str()) == pacing_hex;
     let ident_style = if is_pacing {
         Style::new()
@@ -218,6 +227,14 @@ fn list_row<'a>(t: &Track, pacing_hex: Option<&str>) -> Line<'a> {
     // the callsign. Blank when the Source didn't supply one.
     let kind = t.flight.aircraft_type.as_deref().unwrap_or("");
 
+    // Climb/descend/level glyph glued to the altitude.
+    let (glyph, glyph_color) = trend_glyph(t.flight.vertical_trend());
+
+    let gs_span = match t.flight.groundspeed_kt {
+        Some(g) => Span::raw(format!(" {g:>3.0}kt")),
+        None => Span::raw(String::new()),
+    };
+
     let (arrow, arrow_color, cpa) = match t.cpa {
         Some(c) if c.is_approaching() => (
             "▲",
@@ -228,16 +245,70 @@ fn list_row<'a>(t: &Track, pacing_hex: Option<&str>) -> Line<'a> {
         None => ("·", Color::DarkGray, String::new()),
     };
 
-    Line::from(vec![
-        Span::styled(format!("{:<8}", label(&t.flight)), ident_style),
-        Span::styled(format!(" {kind:<4}"), Style::new().fg(Color::DarkGray)),
-        Span::raw(format!(
-            " {:>5.1}nm {:03.0}° {alt:>7} ",
-            t.distance_nm, t.bearing_from_home
-        )),
-        Span::styled(format!("{arrow} "), Style::new().fg(arrow_color)),
-        Span::raw(cpa),
-    ])
+    // (priority, span): when the row can't fit, the highest-priority-number spans
+    // are dropped first. Kept spans render in this (display) order. Keep, in order:
+    // callsign, distance/bearing, altitude+glyph, groundspeed, type, then CPA.
+    let spans = vec![
+        (0, Span::styled(format!("{:<8}", label(&t.flight)), ident_style)),
+        (
+            4,
+            Span::styled(format!(" {kind:<4}"), Style::new().fg(Color::DarkGray)),
+        ),
+        (
+            1,
+            Span::raw(format!(
+                " {:>5.1}nm {:03.0}°",
+                t.distance_nm, t.bearing_from_home
+            )),
+        ),
+        (2, Span::raw(format!(" {alt:>7}"))),
+        (
+            2,
+            Span::styled(glyph.to_string(), Style::new().fg(glyph_color)),
+        ),
+        (3, gs_span),
+        (
+            5,
+            Span::styled(format!(" {arrow} "), Style::new().fg(arrow_color)),
+        ),
+        (5, Span::raw(cpa)),
+    ];
+    fit_spans(spans, max_width)
+}
+
+/// The list glyph and colour for a vertical trend. Unknown renders blank rather
+/// than a fake symbol.
+fn trend_glyph(trend: VerticalTrend) -> (&'static str, Color) {
+    match trend {
+        VerticalTrend::Climb => ("↑", Color::Green),
+        VerticalTrend::Descend => ("↓", Color::Cyan),
+        VerticalTrend::Level => ("–", Color::DarkGray),
+        VerticalTrend::Unknown => ("", Color::DarkGray),
+    }
+}
+
+/// Assemble row spans to fit `max` columns. Each span carries a priority; when the
+/// full row is too wide, spans are dropped lowest-priority (highest number) first.
+/// Whatever survives renders in the original order, so the row degrades gracefully
+/// on a narrow terminal instead of clipping its rightmost (newest) data.
+fn fit_spans(spans: Vec<(u8, Span<'static>)>, max: u16) -> Line<'static> {
+    let mut keep = vec![false; spans.len()];
+    let mut used = 0u16;
+    let mut by_priority: Vec<usize> = (0..spans.len()).collect();
+    by_priority.sort_by_key(|&i| spans[i].0);
+    for i in by_priority {
+        let w = spans[i].1.width() as u16;
+        if used.saturating_add(w) <= max {
+            keep[i] = true;
+            used = used.saturating_add(w);
+        }
+    }
+    let kept: Vec<Span<'static>> = spans
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, (_, s))| keep[i].then_some(s))
+        .collect();
+    Line::from(kept)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -319,7 +390,7 @@ fn draw_status(
     match selected {
         Some(s) => lines.push(Line::from(Span::styled(s, Style::new().fg(Color::White)))),
         None => lines.push(Line::from(Span::styled(
-            "↑/↓ select · Esc clear · q quit",
+            "↑/↓ select · Enter detail · Esc clear · q quit",
             Style::new().fg(Color::DarkGray),
         ))),
     }
@@ -334,6 +405,165 @@ fn draw_status(
         Paragraph::new(lines).block(Block::bordered().title(" status ")),
         area,
     );
+}
+
+/// The flight-detail popup: dim the frame, clear a centered box, and fill it with
+/// the inspected flight's data — or a "left the area" notice if it has dropped out
+/// of the Search area while the popup was open (never fabricated values).
+fn draw_detail(frame: &mut Frame, tracks: &[Track], selected_hex: Option<&str>, scroll: u16) {
+    let full = frame.area();
+    frame
+        .buffer_mut()
+        .set_style(full, Style::new().add_modifier(Modifier::DIM));
+
+    let area = centered_rect(full, 64, 80, 78, 32);
+    frame.render_widget(Clear, area);
+
+    let track = selected_hex.and_then(|h| tracks.iter().find(|t| t.flight.hex == h));
+    let lines = match track {
+        Some(t) => detail_lines(t),
+        None => vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  — flight left the area —",
+                Style::new().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Esc close · ↑/↓ next flight",
+                Style::new().fg(Color::DarkGray),
+            )),
+        ],
+    };
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title(" flight detail "))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        area,
+    );
+}
+
+/// Every displayable field for one flight: a header, the promoted typed fields
+/// grouped under "Position & motion" / "Transponder", then the Source-contributed
+/// [`crate::domain::DetailGroup`]s rendered generically (no per-Source code).
+fn detail_lines(t: &Track) -> Vec<Line<'static>> {
+    let f = &t.flight;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    lines.push(Line::from(Span::styled(
+        label(f),
+        Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+    )));
+    if let Some(r) = &f.registration {
+        lines.push(field_line("Registration", r));
+    }
+    if let Some(o) = &f.operator {
+        lines.push(field_line("Operator", o));
+    }
+    let kind = match (&f.aircraft_type, &f.model) {
+        (Some(ty), Some(m)) => Some(format!("{ty} · {m}")),
+        (Some(ty), None) => Some(ty.clone()),
+        (None, Some(m)) => Some(m.clone()),
+        (None, None) => None,
+    };
+    if let Some(k) = kind {
+        lines.push(field_line("Type", &k));
+    }
+    if let Some(c) = &f.emitter_category {
+        lines.push(field_line("Category", c));
+    }
+
+    section_title(&mut lines, "Position & motion");
+    lines.push(field_line("Distance", &format!("{:.1} nm", t.distance_nm)));
+    lines.push(field_line("Bearing", &format!("{:03.0}°", t.bearing_from_home)));
+    if let Some(a) = f.altitude_ft {
+        lines.push(field_line("Baro alt", &format!("{a:.0} ft")));
+    }
+    if let Some(a) = f.geometric_altitude_ft {
+        lines.push(field_line("Geo alt", &format!("{a:.0} ft")));
+    }
+    if let Some(r) = f.vertical_rate_fpm {
+        let (glyph, _) = trend_glyph(f.vertical_trend());
+        lines.push(field_line("Vertical rate", &format!("{r:+.0} fpm {glyph}")));
+    }
+    if let Some(g) = f.groundspeed_kt {
+        lines.push(field_line("Groundspeed", &format!("{g:.0} kt")));
+    }
+    if let Some(tr) = f.track_deg {
+        lines.push(field_line("Track", &format!("{tr:03.0}°")));
+    }
+    lines.push(field_line(
+        "Position",
+        &format!("{:.4}, {:.4}", t.estimated.lat, t.estimated.lon),
+    ));
+    lines.push(field_line(
+        "Position age",
+        &format!("{:.0}s", t.age.as_secs_f64()),
+    ));
+
+    if f.squawk.is_some() || f.emergency.is_some() {
+        section_title(&mut lines, "Transponder");
+        if let Some(s) = &f.squawk {
+            lines.push(field_line("Squawk", s));
+        }
+        if let Some(e) = &f.emergency {
+            lines.push(field_line("Emergency", e));
+        }
+    }
+
+    // The opaque, Source-formatted detail groups — rendered verbatim.
+    for group in &f.details {
+        section_title(&mut lines, &group.title);
+        for (label, value) in &group.fields {
+            lines.push(field_line(label, value));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Esc close · ↑/↓ flight · PgUp/PgDn scroll",
+        Style::new().fg(Color::DarkGray),
+    )));
+    lines
+}
+
+/// A blank spacer then a styled section heading.
+fn section_title(lines: &mut Vec<Line<'static>>, title: &str) {
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        title.to_string(),
+        Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    )));
+}
+
+/// One `label   value` row inside the popup.
+fn field_line(label: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("  {label:<16}"),
+            Style::new().fg(Color::DarkGray),
+        ),
+        Span::raw(value.to_string()),
+    ])
+}
+
+/// A box of `pct_x`×`pct_y` percent of `area`, capped at `max_x`×`max_y` cells,
+/// centered within `area`.
+fn centered_rect(area: Rect, pct_x: u16, pct_y: u16, max_x: u16, max_y: u16) -> Rect {
+    let w = ((area.width as u32 * pct_x as u32 / 100) as u16)
+        .min(max_x)
+        .min(area.width);
+    let h = ((area.height as u32 * pct_y as u32 / 100) as u16)
+        .min(max_y)
+        .min(area.height);
+    Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    }
 }
 
 /// A flight's radar position as (east, north) nm offsets from Home.
@@ -395,11 +625,19 @@ mod tests {
             ident: Some(ident.into()),
             aircraft_type: Some("B738".into()),
             model: Some("BOEING 737-800".into()),
+            registration: None,
+            operator: None,
             position: pos,
             altitude_ft: Some(30_000.0),
+            geometric_altitude_ft: None,
             groundspeed_kt: Some(gs),
             track_deg: Some(track),
+            vertical_rate_fpm: Some(1200.0),
+            squawk: None,
+            emergency: None,
+            emitter_category: None,
             reported_age: Duration::ZERO,
+            details: Vec::new(),
         }
     }
 
@@ -450,5 +688,93 @@ mod tests {
         ] {
             assert!(text.contains(needle), "rendered frame missing {needle:?}");
         }
+    }
+
+    fn test_app() -> App {
+        let area = SearchArea {
+            center: LatLon::new(0.0, 0.0),
+            radius_nm: 100.0,
+        };
+        let cfg = TrackerConfig {
+            relevance_distance_nm: 30.0,
+            stale_after: Duration::from_secs(120),
+            max_flight_age: Duration::from_secs(120),
+        };
+        App::new(area, cfg, "testsrc".into(), Duration::from_millis(250), 30.0)
+    }
+
+    fn render_to_text(app: &mut App, w: u16, h: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    fn ingest_one(app: &mut App, f: Flight) {
+        app.on_update(PollUpdate::Snapshot {
+            snapshot: Snapshot::new(vec![f], Instant::now()),
+            next_interval: Duration::from_secs(1),
+        });
+    }
+
+    #[test]
+    fn popup_paints_detail_in_detail_mode() {
+        let mut app = test_app();
+        let mut f = moving("sel123", "SELFLT", LatLon::new(0.05, 0.0), 90.0, 452.0);
+        f.registration = Some("N12345".into());
+        f.details = vec![crate::domain::DetailGroup {
+            title: "Signal".into(),
+            fields: vec![("RSSI".into(), "-7.4 dBFS".into())],
+        }];
+        ingest_one(&mut app, f);
+        app.selected_hex = Some("sel123".into());
+        app.mode = Mode::Detail;
+
+        let text = render_to_text(&mut app, 120, 40);
+        for needle in [
+            "flight detail",
+            "SELFLT",
+            "N12345",
+            "Position & motion",
+            "Signal",
+            "RSSI",
+            "452 kt",
+        ] {
+            assert!(text.contains(needle), "popup missing {needle:?}");
+        }
+    }
+
+    #[test]
+    fn popup_shows_left_the_area_when_flight_absent() {
+        let mut app = test_app();
+        ingest_one(
+            &mut app,
+            moving("present", "PRESENT", LatLon::new(0.05, 0.0), 90.0, 300.0),
+        );
+        app.selected_hex = Some("ghost".into()); // never in the Snapshot
+        app.mode = Mode::Detail;
+
+        let text = render_to_text(&mut app, 120, 40);
+        assert!(
+            text.contains("flight left the area"),
+            "expected the left-the-area notice"
+        );
+    }
+
+    #[test]
+    fn list_row_survives_a_narrow_terminal() {
+        let mut app = test_app();
+        ingest_one(
+            &mut app,
+            moving("aaa111", "TIGHTONE", LatLon::new(0.05, 0.0), 90.0, 452.0),
+        );
+        // Must not panic; the callsign (highest priority) survives truncation.
+        let text = render_to_text(&mut app, 40, 20);
+        assert!(text.contains("TIGHTONE"), "callsign should survive");
     }
 }

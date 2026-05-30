@@ -90,6 +90,55 @@ aircraft have neither), and the flight is still tracked without it.
 _Avoid_: treating type as identity — the **hex** (ICAO address) is the stable
 identity across Snapshots; many aircraft share a type.
 
+**Vertical rate**:
+How fast a flight is climbing or descending, in feet per minute (signed; a climb
+is positive). Within a small floor of zero it reads as *level* — the list shows a
+level glyph rather than a misleadingly precise trend. Display-only: like altitude,
+it never affects the Nearest or Pacing flight.
+_Note_: the Source may report a barometric and a geometric rate; the domain carries
+one neutral number, preferring the barometric one.
+
+**Barometric altitude** / **geometric altitude**:
+Two altitudes a Source may report. *Barometric* altitude is pressure-derived (what
+ATC means by "altitude"); *geometric* altitude is GNSS-derived height. Both are
+display-only and either may be absent. The Nearest flight is measured by *ground*
+distance only — neither altitude is part of it.
+_Avoid_: treating the two as interchangeable; they can differ by hundreds of feet.
+
+**Registration** (tail number):
+The aircraft's civil registration (e.g. `N292WN`), tied to the airframe rather than
+the flight. Descriptive only.
+_Avoid_: using it as identity — the **hex** is the stable identity; a registration
+can be absent and is reassigned across airframes over time.
+
+**Operator**:
+The owner/operating organisation a Source attributes to the aircraft (e.g.
+"SOUTHWEST AIRLINES CO"). Descriptive only; often absent for GA aircraft.
+
+**Squawk**:
+The four-digit transponder code (an octal code, e.g. `1200`, `7700`) a flight is
+broadcasting. Carried as text, never as a number. Descriptive only.
+_Note_: emergencies surface through the separate *emergency* state, not by the app
+interpreting special squawks itself.
+
+**Emitter category**:
+A Source's coarse classification of the aircraft (light, large, heavy, rotorcraft,
+…), decoded by the adapter from its wire code. Descriptive only; absent when the
+Source doesn't classify the aircraft.
+_Avoid_: treating the raw code (`A3`) as domain language — the domain carries the
+decoded human label; the code lives only inside the adapter.
+
+**Flight details**:
+Source-contributed, display-only telemetry shown *only* in the flight-detail
+popup — signal strength, message counts, position-integrity figures,
+navigation/autopilot selections, data provenance, and the like. The Source
+pre-formats and groups these into labelled `(label, value)` pairs; the app renders
+them verbatim and reasons about none of them. Like aircraft type and model, they
+are purely descriptive — they never affect the Nearest or Pacing flight, and a
+Source that supplies none simply yields an empty popup body.
+_Avoid_: naming specific wire fields (RSSI, NIC, MLAT, …) anywhere above the
+adapter — by design they exist only as opaque strings in a detail group (ADR-0004).
+
 ## Example dialogue
 
 > **Dev:** If a jet is directly overhead at 36,000 ft, is that the nearest flight?

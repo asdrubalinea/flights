@@ -32,6 +32,29 @@ pub struct SearchArea {
     pub radius_nm: f64,
 }
 
+/// Source-contributed, display-only telemetry for one flight, already formatted
+/// and grouped by the adapter (the only layer that understands the wire fields).
+/// Rendered verbatim in the flight-detail popup with no per-Source code; never
+/// parsed back; never affects the Nearest or Pacing flight. Names no wire field
+/// by design — every value is an opaque, pre-formatted string (ADR-0004).
+#[derive(Debug, Clone, Default)]
+pub struct DetailGroup {
+    /// Section heading, e.g. `"Signal"`, `"Integrity"`.
+    pub title: String,
+    /// `(label, value)` pairs, pre-formatted with units by the adapter.
+    pub fields: Vec<(String, String)>,
+}
+
+/// Whether a flight is climbing, descending, or holding level — the displayable
+/// fact derived from [`Flight::vertical_rate_fpm`]. The UI maps it to a glyph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerticalTrend {
+    Climb,
+    Descend,
+    Level,
+    Unknown,
+}
+
 /// One airborne flight as last reported by a Source.
 ///
 /// Only the fields the app reasons about or renders are kept; a Source omits any
@@ -51,19 +74,46 @@ pub struct Flight {
     /// Human-readable model description (e.g. `"BOEING 737-800"`), when known.
     /// Shown in the selected-flight detail; often absent for GA/uncatalogued craft.
     pub model: Option<String>,
+    /// Civil registration / tail number (e.g. `"N292WN"`), when the Source supplies
+    /// it. Tied to the airframe, not the flight; purely descriptive — the **hex**
+    /// remains the stable identity. Often absent for blocked or uncatalogued craft.
+    pub registration: Option<String>,
+    /// Owner/operating organisation (e.g. `"SOUTHWEST AIRLINES CO"`), when known.
+    /// Descriptive only; commonly absent for GA aircraft.
+    pub operator: Option<String>,
     /// Last reported ground position.
     pub position: LatLon,
-    /// Barometric altitude in feet, when known. Altitude is **not** part of the
-    /// nearest-flight measure — it is carried only for display.
+    /// Barometric (pressure-derived) altitude in feet, when known. Altitude is
+    /// **not** part of the nearest-flight measure — it is carried only for display.
     pub altitude_ft: Option<f64>,
+    /// Geometric (GNSS-derived) altitude in feet, when known. Distinct from the
+    /// barometric `altitude_ft` and may differ by hundreds of feet; display-only.
+    pub geometric_altitude_ft: Option<f64>,
     /// Groundspeed in knots, when known.
     pub groundspeed_kt: Option<f64>,
     /// Track over the ground, degrees clockwise from true north, when known.
     pub track_deg: Option<f64>,
+    /// Vertical rate in feet per minute, signed (climb positive), when known.
+    /// Display-only — like altitude, it never affects the Nearest or Pacing flight.
+    /// The Source's barometric rate when present, else its geometric rate.
+    pub vertical_rate_fpm: Option<f64>,
+    /// Transponder squawk code (an octal code, e.g. `"1200"`), carried as text and
+    /// never as a number. Descriptive only.
+    pub squawk: Option<String>,
+    /// Emergency state, when one is being broadcast. `None` covers both "no field"
+    /// and the routine `"none"` value, so a quiet flight surfaces nothing.
+    pub emergency: Option<String>,
+    /// Coarse aircraft classification decoded by the adapter (e.g. "large",
+    /// "rotorcraft"), when the Source classifies it. The raw wire code lives only
+    /// inside the adapter; the domain carries the human label. Descriptive only.
+    pub emitter_category: Option<String>,
     /// How old the position report already was at the Snapshot's instant (the
     /// Source's `seen_pos`). Dead reckoning extrapolates by this *plus* the time
     /// elapsed since the Snapshot, so the estimate tracks true wall-clock age.
     pub reported_age: Duration,
+    /// Source-contributed, display-only telemetry shown in the flight-detail popup.
+    /// Empty when the Source supplies none. See [`DetailGroup`].
+    pub details: Vec<DetailGroup>,
 }
 
 impl Flight {
@@ -77,11 +127,27 @@ impl Flight {
             _ => None,
         }
     }
+
+    /// Whether the flight is climbing, descending, or level, from its vertical
+    /// rate. A rate within [`VERTICAL_LEVEL_FLOOR_FPM`] of zero reads as level so
+    /// the display shows a level glyph rather than a misleadingly precise trend.
+    pub fn vertical_trend(&self) -> VerticalTrend {
+        match self.vertical_rate_fpm {
+            None => VerticalTrend::Unknown,
+            Some(r) if r.abs() < VERTICAL_LEVEL_FLOOR_FPM => VerticalTrend::Level,
+            Some(r) if r > 0.0 => VerticalTrend::Climb,
+            Some(_) => VerticalTrend::Descend,
+        }
+    }
 }
 
 /// Groundspeed below this (knots) is treated as stationary: no dead reckoning,
 /// no CPA. Filters out parked/taxiing noise that slips through the ground filter.
 pub const MOVING_FLOOR_KT: f64 = 1.0;
+
+/// Vertical rate within this many feet per minute of zero is treated as level
+/// flight — below the noise floor of a meaningful climb or descent.
+pub const VERTICAL_LEVEL_FLOOR_FPM: f64 = 100.0;
 
 /// A **Snapshot**: the complete set of airborne flights in the Search area as of
 /// a single poll. A new Snapshot replaces the previous one wholesale — flights it
@@ -98,5 +164,45 @@ pub struct Snapshot {
 impl Snapshot {
     pub fn new(flights: Vec<Flight>, taken_at: Instant) -> Self {
         Self { flights, taken_at }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_rate(rate: Option<f64>) -> Flight {
+        Flight {
+            hex: "abc".into(),
+            ident: None,
+            aircraft_type: None,
+            model: None,
+            registration: None,
+            operator: None,
+            position: LatLon::new(0.0, 0.0),
+            altitude_ft: None,
+            geometric_altitude_ft: None,
+            groundspeed_kt: None,
+            track_deg: None,
+            vertical_rate_fpm: rate,
+            squawk: None,
+            emergency: None,
+            emitter_category: None,
+            reported_age: Duration::ZERO,
+            details: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn vertical_trend_classifies_around_the_level_floor() {
+        assert_eq!(with_rate(None).vertical_trend(), VerticalTrend::Unknown);
+        assert_eq!(with_rate(Some(0.0)).vertical_trend(), VerticalTrend::Level);
+        assert_eq!(with_rate(Some(99.0)).vertical_trend(), VerticalTrend::Level);
+        assert_eq!(with_rate(Some(-99.0)).vertical_trend(), VerticalTrend::Level);
+        assert_eq!(with_rate(Some(100.0)).vertical_trend(), VerticalTrend::Climb);
+        assert_eq!(
+            with_rate(Some(-100.0)).vertical_trend(),
+            VerticalTrend::Descend
+        );
     }
 }

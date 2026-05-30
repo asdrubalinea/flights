@@ -75,11 +75,15 @@ fn event_loop(
 
         // Block for input only up to one frame; the timeout is what paces the
         // dead-reckoned redraw.
-        match event::next_action(app.fps_interval)? {
+        match event::next_action(app.fps_interval, app.mode)? {
             Action::Quit => app.running = false,
             Action::SelectNext => app.select_next(),
             Action::SelectPrev => app.select_prev(),
             Action::ClearSelection => app.clear_selection(),
+            Action::OpenDetail => app.open_detail(),
+            Action::CloseDetail => app.close_detail(),
+            Action::ScrollUp => app.scroll_detail(-5),
+            Action::ScrollDown => app.scroll_detail(5),
             Action::None => {}
         }
     }

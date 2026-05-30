@@ -277,11 +277,19 @@ mod tests {
             ident: None,
             aircraft_type: None,
             model: None,
+            registration: None,
+            operator: None,
             position: pos,
             altitude_ft: Some(30_000.0),
+            geometric_altitude_ft: None,
             groundspeed_kt: None,
             track_deg: None,
+            vertical_rate_fpm: None,
+            squawk: None,
+            emergency: None,
+            emitter_category: None,
             reported_age: Duration::ZERO,
+            details: Vec::new(),
         }
     }
 
