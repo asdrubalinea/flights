@@ -38,6 +38,9 @@ OPTIONS:
     --once             Fetch a single snapshot, print nearest/pacing, exit
     --print-config     Print the resolved config and exit
     --config <PATH>    Use an explicit config file
+    --cors-allow-origin <ORIGIN>
+                       Send Access-Control-Allow-Origin: <ORIGIN> (overrides config;
+                       e.g. http://127.0.0.1:8080 for the webclient, or *)
     -h, --help         Show this help
 
 Config lives at $XDG_CONFIG_HOME/flights/config.toml (default $HOME/.config).
@@ -54,11 +57,14 @@ enum Mode {
 struct Args {
     mode: Mode,
     config_path: Option<PathBuf>,
+    /// `--cors-allow-origin <ORIGIN>` override, applied onto the loaded config.
+    cors_allow_origin: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut mode = None;
     let mut config_path = None;
+    let mut cors_allow_origin = None;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let new_mode = match arg.as_str() {
@@ -73,6 +79,13 @@ fn parse_args() -> Result<Args, String> {
                 ));
                 None
             }
+            "--cors-allow-origin" => {
+                cors_allow_origin = Some(
+                    it.next()
+                        .ok_or_else(|| "--cors-allow-origin requires an origin".to_string())?,
+                );
+                None
+            }
             other => return Err(format!("unknown argument: {other}")),
         };
         if let Some(m) = new_mode {
@@ -85,6 +98,7 @@ fn parse_args() -> Result<Args, String> {
     Ok(Args {
         mode: mode.unwrap_or(Mode::Serve),
         config_path,
+        cors_allow_origin,
     })
 }
 
@@ -117,7 +131,18 @@ fn main() -> ExitCode {
         None => eprintln!("config: using built-in defaults (no config file found)"),
     }
 
-    let cfg = loaded.config;
+    let mut cfg = loaded.config;
+    // A `--cors-allow-origin` flag overrides the config (an explicit per-run opt-in).
+    if let Some(origin) = args.cors_allow_origin {
+        if let Err(e) = cfg.override_cors(origin) {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!(
+            "CORS: allowing origin {}",
+            cfg.server.cors_allow_origin.as_deref().unwrap_or("")
+        );
+    }
     let result = match args.mode {
         Mode::PrintConfig => {
             println!("{}", cfg.summary());

@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# flights-web — launch the Server and the radar webclient together with one command.
+#
+# The webclient is a thin Client (ADR-0005/0007): it renders, the Server owns the
+# engine. So this is a *launcher*, not a merge — it starts `flights-server` in the
+# background, waits for it to bind, then runs `trunk serve` in the foreground to
+# build and serve the Leptos/WASM client. Stopping the serve (Ctrl-C) stops only a
+# Server this script started.
+#
+# Unlike the TUI, the webclient can't ship as a prebuilt binary: Trunk compiles it
+# to wasm from source, so this needs the wasm toolchain (the Nix dev shell, or
+# `nix run .#web`, provides the `wasm32` target + `trunk` + a matching
+# `wasm-bindgen-cli`). In the dev shell `flights-web` is already on PATH.
+#
+# It honours the single-poller invariant the whole split exists for: if a Server is
+# already answering, it is REUSED and left running — we never spawn a second poller
+# against a rate-limited Source.
+#
+# The webclient reads the Server cross-origin, so the Server must allow the
+# webclient's origin (off by default — ADR-0005/0007). When this script *starts*
+# the Server it passes `--cors-allow-origin <origin>` (an explicit per-run opt-in),
+# so it just works. A Server it REUSES keeps its own config; if that doesn't allow
+# this origin, the script warns with the exact one-line fix rather than leaving the
+# page mysteriously stuck on UNREACHABLE.
+#
+#   nix run .#web          # bundles the toolchain; build the client from the repo
+#   ./scripts/flights-web  # dev checkout / dev shell: same thing
+#   flights-web            # on PATH inside `nix develop` / direnv
+#
+# Env overrides:
+#   FLIGHTS_URL          Server probe/reuse target    (default http://127.0.0.1:7878)
+#   WEB_PORT             port for `trunk serve`        (default 8080)
+#   FLIGHTS_WEB_DIR      the flights-web crate dir     (default: repo, else ./flights-web)
+#   FLIGHTS_SERVER_BIN   explicit flights-server path  (default: PATH, else cargo build)
+#   FLIGHTS_SERVER_ARGS  extra args for the spawned Server (e.g. "--config foo.toml")
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+flights-web — launch flights-server + the radar webclient together
+
+USAGE:
+    flights-web [TRUNK SERVE OPTIONS]
+
+Starts flights-server in the background (or reuses one already running), waits for
+it to bind, checks that it allows the webclient's origin over CORS, then runs
+`trunk serve` in the foreground. Stopping the serve stops only a Server this
+launcher started. Extra options pass through to `trunk serve`.
+
+Open the page at http://127.0.0.1:$WEB_PORT (default 8080). Point it at a
+non-default Server in the browser with `?server=http://host:port`.
+
+Env: FLIGHTS_URL, WEB_PORT, FLIGHTS_WEB_DIR, FLIGHTS_SERVER_BIN, FLIGHTS_SERVER_ARGS.
+EOF
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    -h | --help)
+      usage
+      exit 0
+      ;;
+  esac
+done
+
+url="${FLIGHTS_URL:-http://127.0.0.1:7878}"
+web_port="${WEB_PORT:-8080}"
+web_origin="http://127.0.0.1:${web_port}"
+
+# Locate the flights-web crate (where Trunk builds from). A dev checkout has it as
+# a sibling of this script's repo root; otherwise fall back to ./flights-web in the
+# current directory (the `nix run .#web` case, run from the repo).
+web_dir="${FLIGHTS_WEB_DIR:-}"
+if [[ -z "$web_dir" ]]; then
+  root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  if [[ -f "$root/flights-web/index.html" ]]; then
+    web_dir="$root/flights-web"
+  elif [[ -f "./flights-web/index.html" ]]; then
+    web_dir="$(cd ./flights-web && pwd)"
+  else
+    echo "flights-web: can't find the flights-web crate. Run from the repo root, or set FLIGHTS_WEB_DIR." >&2
+    exit 1
+  fi
+fi
+
+if ! command -v trunk >/dev/null 2>&1; then
+  echo "flights-web: 'trunk' is not on PATH. Enter the dev shell ('nix develop') or use 'nix run .#web'." >&2
+  exit 1
+fi
+
+# Resolve the Server binary, mirroring flights-radar: explicit env wins, else build
+# from a dev checkout so you exercise local code, else take it off PATH.
+server_bin="${FLIGHTS_SERVER_BIN:-}"
+if [[ -z "$server_bin" ]]; then
+  repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  if [[ -f "$repo/Cargo.toml" ]] && command -v cargo >/dev/null 2>&1; then
+    echo "flights-web: building flights-server (cargo)…" >&2
+    cargo build --manifest-path "$repo/Cargo.toml" -p flights-server
+    server_bin="$repo/target/debug/flights-server"
+  elif command -v flights-server >/dev/null 2>&1; then
+    server_bin="$(command -v flights-server)"
+  else
+    echo "flights-web: no 'flights-server' on PATH and no cargo workspace to build." >&2
+    exit 1
+  fi
+fi
+
+# A Server is "up" once /meta answers.
+reachable() { curl -fsS --max-time 2 "$url/meta" >/dev/null 2>&1; }
+
+# Tear down only a Server we started; a reused one is left for whatever else uses it.
+started_pid=""
+cleanup() {
+  if [[ -n "$started_pid" ]] && kill -0 "$started_pid" 2>/dev/null; then
+    kill "$started_pid" 2>/dev/null || true
+    wait "$started_pid" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+if reachable; then
+  echo "flights-web: reusing the flights-server already at $url" >&2
+else
+  log="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/flights.log"
+  echo "flights-web: starting flights-server (logging to $log)…" >&2
+  # Allow the webclient's origin for this run (CORS stays off by default otherwise).
+  read -ra server_args <<<"${FLIGHTS_SERVER_ARGS:-}"
+  if ((${#server_args[@]})); then
+    "$server_bin" --cors-allow-origin "$web_origin" "${server_args[@]}" >"$log" 2>&1 &
+  else
+    "$server_bin" --cors-allow-origin "$web_origin" >"$log" 2>&1 &
+  fi
+  started_pid=$!
+
+  for ((i = 0; i < 50; i++)); do
+    if reachable; then break; fi
+    if ! kill -0 "$started_pid" 2>/dev/null; then
+      echo "flights-web: flights-server exited during startup — last lines of $log:" >&2
+      tail -n 20 "$log" >&2 || true
+      exit 1
+    fi
+    sleep 0.1
+  done
+  if ! reachable; then
+    echo "flights-web: flights-server did not come up within 5s. See $log." >&2
+    exit 1
+  fi
+fi
+
+# The browser will block the cross-origin reads unless the Server sends an
+# Access-Control-Allow-Origin the page's origin satisfies. Check it and, if it's
+# missing, point at the exact one-line fix rather than letting the page sit on
+# UNREACHABLE with no explanation.
+acao="$(curl -fsS --max-time 2 -D - -o /dev/null -H "Origin: $web_origin" "$url/meta" 2>/dev/null \
+  | tr -d '\r' | awk -F': ' 'tolower($1) == "access-control-allow-origin" { print $2 }')"
+if [[ "$acao" != "$web_origin" && "$acao" != "*" ]]; then
+  cfg="${XDG_CONFIG_HOME:-$HOME/.config}/flights/config.toml"
+  echo "flights-web: WARNING — the Server at $url does not allow this origin over CORS," >&2
+  echo "             so the page will show UNREACHABLE. Add to $cfg:" >&2
+  echo "" >&2
+  echo "                 [server]" >&2
+  echo "                 cors_allow_origin = \"$web_origin\"" >&2
+  echo "" >&2
+  echo "             then restart flights-server. (Serving anyway.)" >&2
+fi
+
+echo "flights-web: serving the webclient at $web_origin (Ctrl-C to stop)" >&2
+cd "$web_dir"
+trunk serve --port "$web_port" "$@"

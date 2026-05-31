@@ -25,6 +25,11 @@ never computes which flight is nearest or where a blip belongs; that is always t
 Server's answer. Whether a flight is close enough to be worth showing is Client
 policy, distinct from **Relevance distance** (which gates the Server's pacing,
 never a Client's display).
+_Note_: projecting the Server's answer onto a particular screen — polar
+(`distance_nm`, `bearing_deg`) → pixels on a canvas of a given size, scaled to the
+viewport — is display, not geometry. A Client may scale and place blips for its own
+viewport; what it may never do is *derive* a flight's position, distance, bearing, or
+which flight is nearest. Drawing a Server answer is not computing one.
 
 **Nearest flight**:
 The airborne flight whose last reported position is the smallest great-circle

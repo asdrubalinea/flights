@@ -1,0 +1,7 @@
+# Trunk dev server (ADR-0007). The webclient is served from its own origin,
+# http://127.0.0.1:8080 — the origin the Server opts into via
+# `server.cors_allow_origin`. 127.0.0.1 + 8080 are Trunk's defaults; pinned here
+# so the origin is explicit and stable.
+[serve]
+addresses = ["127.0.0.1"]
+port = 8080
