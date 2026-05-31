@@ -66,6 +66,26 @@
           ];
           text = builtins.readFile ./scripts/flights-radar;
         };
+
+        # `nix run .#web` — launch the Server and the radar webclient together.
+        # Unlike the TUI, the webclient can't ship as a prebuilt binary: Trunk
+        # compiles it to wasm from source (ADR-0007). So this bundles the wasm
+        # toolchain — `rustToolchain` (which carries the wasm32 std), `trunk`, and a
+        # version-matched `wasm-bindgen-cli` — beside the packaged `flights-server`,
+        # and builds ./flights-web from the current checkout. The launcher logic
+        # lives in ./scripts/flights-web (one copy, shared with the dev shell).
+        web = pkgs.writeShellApplication {
+          name = "flights-web";
+          runtimeInputs = [
+            flights # provides flights-server
+            rustToolchain # cargo + rustc + the wasm32 std, for Trunk's build
+            pkgs.trunk
+            pkgs.wasm-bindgen-cli # must match the pinned wasm-bindgen crate
+            pkgs.curl # the /meta readiness + CORS probe
+            pkgs.coreutils # sleep / tail / tr
+          ];
+          text = builtins.readFile ./scripts/flights-web;
+        };
       in
       {
         # `nix build` / `nix build .#flights` -> ./result/bin/{flights,flights-server}
@@ -74,14 +94,20 @@
           default = flights;
           flights = flights;
           radar = radar;
+          web = web;
         };
 
-        # `nix run` (the TUI alone), `nix run .#radar` (Server + TUI together)
+        # `nix run` (the TUI alone), `nix run .#radar` (Server + TUI together),
+        # `nix run .#web` (Server + webclient together)
         apps = {
           default = flake-utils.lib.mkApp { drv = flights; };
           radar = flake-utils.lib.mkApp {
             drv = radar;
             name = "flights-radar";
+          };
+          web = flake-utils.lib.mkApp {
+            drv = web;
+            name = "flights-web";
           };
         };
 
@@ -94,6 +120,15 @@
             cargo-watch
             cargo-edit
             curl # flights-radar's readiness probe (also handy for poking the REST API)
+
+            # The webclient toolchain (ADR-0007). `rustToolchain` already carries
+            # the wasm32 std (rust-toolchain.toml's `targets`); these two bundle it
+            # into a deployable directory. wasm-bindgen-cli must match the
+            # `wasm-bindgen` crate version exactly, so flights-web pins its
+            # `wasm-bindgen` dependency to this package's version (currently
+            # ${wasm-bindgen-cli.version}).
+            trunk
+            wasm-bindgen-cli
           ]);
 
           # Let rust-analyzer find the standard library sources.

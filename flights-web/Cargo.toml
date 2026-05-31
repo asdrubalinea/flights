@@ -1,0 +1,38 @@
+[package]
+name = "flights-web"
+description = "Leptos/WASM webclient — a thin Client that renders the flights Server's REST API over CORS (ADR-0007)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Webclient-only dependencies. These leptos/wasm crates are shared by no host
+# crate, so they live here rather than in the workspace's [dependencies] table
+# (ADR-0007) — keeping that table about the wire contract the Server and Clients
+# share. Only `flights-api` is shared: deserializing the *same* structs the TUI
+# uses is the whole point of a Rust webclient (ADR-0005/0007).
+#
+# The wasm-bindgen family is pinned with `=`: Trunk runs the `wasm-bindgen-cli`
+# the Nix dev shell provides (currently 0.2.121), and the CLI must match the
+# `wasm-bindgen` crate version *exactly* or it rejects the module. js-sys,
+# web-sys and wasm-bindgen-futures each pin `wasm-bindgen` back to that same
+# release, so they are pinned to the versions cut alongside 0.2.121.
+[dependencies]
+flights-api = { workspace = true }
+serde = { workspace = true }       # only to name `DeserializeOwned` in the API client bound
+
+leptos = { version = "0.8", features = ["csr"] }
+gloo-net = { version = "0.6", default-features = false, features = ["http", "json"] }
+
+wasm-bindgen = "=0.2.121"
+wasm-bindgen-futures = "=0.4.71"
+web-sys = { version = "=0.3.98", features = [
+  "Window",
+  "Document",
+  "Element",
+  "HtmlElement",
+  "HtmlCanvasElement",
+  "CanvasRenderingContext2d",
+  "KeyboardEvent",
+  "MouseEvent",
+  "Location",
+] }

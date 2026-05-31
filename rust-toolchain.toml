@@ -4,3 +4,7 @@
 [toolchain]
 channel = "stable"
 components = ["rust-src", "rustfmt", "clippy", "rust-analyzer"]
+# The webclient (ADR-0007) compiles to wasm; the toolchain must carry the
+# wasm32 std. Host crates ignore this target — it only matters when Trunk (or a
+# bare `cargo build --target wasm32-unknown-unknown`) builds `flights-web`.
+targets = ["wasm32-unknown-unknown"]

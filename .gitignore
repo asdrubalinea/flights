@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target
 
+# Trunk webclient bundle (ADR-0007)
+/flights-web/dist
+
 # Nix build results
 /result
 /result-*
