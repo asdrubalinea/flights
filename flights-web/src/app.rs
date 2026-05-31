@@ -217,3 +217,34 @@ fn next_index(current: Option<usize>, n: usize, forward: bool) -> usize {
         (None, false) => n - 1,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::next_index;
+
+    #[test]
+    fn steps_forward_and_wraps_past_the_end() {
+        assert_eq!(next_index(Some(0), 3, true), 1);
+        assert_eq!(next_index(Some(2), 3, true), 0);
+    }
+
+    #[test]
+    fn steps_backward_and_wraps_past_the_start() {
+        assert_eq!(next_index(Some(1), 3, false), 0);
+        assert_eq!(next_index(Some(0), 3, false), 2);
+    }
+
+    #[test]
+    fn no_selection_enters_at_an_end() {
+        assert_eq!(next_index(None, 3, true), 0); // first
+        assert_eq!(next_index(None, 3, false), 2); // last
+    }
+
+    #[test]
+    fn single_element_list_stays_put() {
+        assert_eq!(next_index(Some(0), 1, true), 0);
+        assert_eq!(next_index(Some(0), 1, false), 0);
+        assert_eq!(next_index(None, 1, true), 0);
+        assert_eq!(next_index(None, 1, false), 0);
+    }
+}

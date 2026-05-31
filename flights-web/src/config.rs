@@ -69,3 +69,72 @@ impl WebConfig {
         cfg
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_fps(fps: u32) -> WebConfig {
+        WebConfig {
+            fps,
+            ..WebConfig::default()
+        }
+    }
+
+    #[test]
+    fn empty_query_is_all_defaults() {
+        let cfg = WebConfig::from_query("");
+        assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
+        assert_eq!(cfg.fps, DEFAULT_FPS);
+    }
+
+    #[test]
+    fn reads_server_and_fps() {
+        let cfg = WebConfig::from_query("?server=http://10.0.0.2:9000&fps=30");
+        assert_eq!(cfg.server_url, "http://10.0.0.2:9000");
+        assert_eq!(cfg.fps, 30);
+    }
+
+    #[test]
+    fn leading_question_mark_is_optional() {
+        assert_eq!(WebConfig::from_query("fps=15").fps, 15);
+    }
+
+    #[test]
+    fn trailing_slashes_are_trimmed_from_server() {
+        assert_eq!(
+            WebConfig::from_query("?server=http://host:7878/").server_url,
+            "http://host:7878"
+        );
+    }
+
+    #[test]
+    fn fps_is_clamped_to_1_through_60() {
+        assert_eq!(WebConfig::from_query("?fps=0").fps, 1);
+        assert_eq!(WebConfig::from_query("?fps=1").fps, 1);
+        assert_eq!(WebConfig::from_query("?fps=60").fps, 60);
+        assert_eq!(WebConfig::from_query("?fps=1000").fps, 60);
+    }
+
+    #[test]
+    fn malformed_or_empty_values_fall_back_to_defaults() {
+        // Non-numeric fps and an empty server= are both ignored.
+        let cfg = WebConfig::from_query("?fps=fast&server=");
+        assert_eq!(cfg.fps, DEFAULT_FPS);
+        assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
+    }
+
+    #[test]
+    fn unknown_keys_and_valueless_pairs_are_skipped() {
+        let cfg = WebConfig::from_query("?foo=bar&flag&fps=10");
+        assert_eq!(cfg.fps, 10);
+        assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
+    }
+
+    #[test]
+    fn frame_ms_is_integer_division_of_one_second() {
+        assert_eq!(with_fps(4).frame_ms(), 250);
+        assert_eq!(with_fps(60).frame_ms(), 16); // 1000 / 60 truncates
+        assert_eq!(with_fps(1).frame_ms(), 1000);
+    }
+}

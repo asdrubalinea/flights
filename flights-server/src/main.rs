@@ -40,7 +40,8 @@ OPTIONS:
     --config <PATH>    Use an explicit config file
     --cors-allow-origin <ORIGIN>
                        Send Access-Control-Allow-Origin: <ORIGIN> (overrides config;
-                       e.g. http://127.0.0.1:8080 for the webclient, or *)
+                       e.g. http://127.0.0.1:8080 for the webclient). A wildcard
+                       \"*\" is config-file-only, not accepted here.
     -h, --help         Show this help
 
 Config lives at $XDG_CONFIG_HOME/flights/config.toml (default $HOME/.config).
@@ -80,10 +81,18 @@ fn parse_args() -> Result<Args, String> {
                 None
             }
             "--cors-allow-origin" => {
-                cors_allow_origin = Some(
-                    it.next()
-                        .ok_or_else(|| "--cors-allow-origin requires an origin".to_string())?,
-                );
+                let origin = it
+                    .next()
+                    .ok_or_else(|| "--cors-allow-origin requires an origin".to_string())?;
+                // Without this guard a typo like `--cors-allow-origin --once` would
+                // swallow the next flag as the origin (it passes validation) and
+                // silently drop the mode. An origin is a URL or `*`, never `--`-led.
+                if origin.starts_with("--") {
+                    return Err(format!(
+                        "--cors-allow-origin requires an origin, but got the flag {origin:?}"
+                    ));
+                }
+                cors_allow_origin = Some(origin);
                 None
             }
             other => return Err(format!("unknown argument: {other}")),

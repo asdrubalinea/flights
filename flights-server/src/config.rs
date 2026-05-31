@@ -250,8 +250,21 @@ impl Config {
     /// file: it is an explicit per-run opt-in (the launcher uses it to allow the
     /// webclient's loopback origin), mirroring how the TUI's `--server` overrides
     /// its config. CORS stays **off** unless something sets it (ADR-0005/0007).
+    ///
+    /// The flag is the *discoverable* path to CORS, so it will not open the API to
+    /// every origin: a wildcard `*` on a loopback API that serves Home's coordinates
+    /// (via `/meta`) would let any page the user visits read their location. `*`
+    /// stays a deliberate, config-file-only escape hatch (ADR-0007).
     pub fn override_cors(&mut self, origin: String) -> Result<(), ConfigError> {
         validate_cors_origin(&origin)?;
+        if origin == "*" {
+            return Err(ConfigError::Invalid(
+                "--cors-allow-origin does not accept \"*\": name the exact origin \
+                 (e.g. http://127.0.0.1:8080). Set server.cors_allow_origin in the \
+                 config file if a wildcard is truly intended."
+                    .to_string(),
+            ));
+        }
         self.server.cors_allow_origin = Some(origin);
         Ok(())
     }
@@ -586,6 +599,11 @@ mod tests {
         // A bad value is rejected the same way the config-file value would be,
         // rather than panicking later in the per-request header build.
         assert!(cfg.override_cors("has space".into()).is_err());
+        // `*` is a valid header value (the config-file path accepts it — see
+        // `accepts_a_valid_cors_origin`) but the flag will not open the API wide:
+        // the wildcard stays a config-file-only escape hatch (ADR-0007).
+        assert!(validate_cors_origin("*").is_ok());
+        assert!(cfg.override_cors("*".into()).is_err());
     }
 
     #[test]
