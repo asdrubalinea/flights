@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# flights-radar — launch the Server and the radar TUI together with one command.
+#
+# The TUI is a thin Client (ADR-0005): it renders, the Server owns the engine. So
+# this is a *launcher*, not a merge — it starts `flights-server` in the background,
+# waits for it to bind, then runs `flights` in the foreground. Quitting the radar
+# (q / Ctrl-C) stops only the Server this script started.
+#
+# It honours the single-poller invariant the whole split exists for: if a Server is
+# already answering (e.g. one you left running for the waybar module), it is REUSED
+# and left running — we never spawn a second poller against a rate-limited Source.
+#
+#   nix run .#radar            # installed: uses the packaged binaries
+#   ./scripts/flights-radar    # dev checkout: cargo-builds, then runs target/debug
+#
+# Any extra args pass straight to the TUI (e.g. `--config`, `--server URL`); a
+# `--server URL` is also used as the probe target, so pointing the radar at a remote
+# Server suppresses the local spawn.
+#
+# Env overrides:
+#   FLIGHTS_URL          probe/reuse target           (default http://127.0.0.1:7878)
+#   FLIGHTS_SERVER_BIN   explicit flights-server path (default: PATH, else cargo build)
+#   FLIGHTS_TUI_BIN      explicit flights path        (default: PATH, else cargo build)
+#   FLIGHTS_SERVER_ARGS  extra args for the spawned Server (e.g. "--config foo.toml")
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+flights-radar — launch flights-server + the radar TUI together
+
+USAGE:
+    flights-radar [TUI OPTIONS]
+
+Starts flights-server in the background (or reuses one already running), waits
+for it to bind, then runs the radar in the foreground. Quitting the radar stops
+only a Server this launcher started. Any options are passed through to the TUI:
+
+    --server <URL>     Server base URL (also used as the readiness probe target)
+    --config <PATH>    TUI client config file
+    -h, --help         Show this help (the launcher's; `flights --help` for the TUI's)
+
+Env: FLIGHTS_URL, FLIGHTS_SERVER_BIN, FLIGHTS_TUI_BIN, FLIGHTS_SERVER_ARGS.
+EOF
+}
+
+# Args after this script go to the TUI. A `--server URL` among them also becomes the
+# probe target, so we don't start a local Server the user is steering away from.
+tui_args=("$@")
+url="${FLIGHTS_URL:-http://127.0.0.1:7878}"
+for ((i = 0; i < ${#tui_args[@]}; i++)); do
+  case "${tui_args[i]}" in
+    -h | --help)
+      # Answer here so `flights-radar --help` never builds or spawns a Server.
+      usage
+      exit 0
+      ;;
+    --server)
+      if ((i + 1 < ${#tui_args[@]})); then url="${tui_args[i + 1]}"; fi
+      ;;
+  esac
+done
+
+# Resolve the two binaries. A dev checkout (this script lives under the repo's
+# scripts/, so a sibling Cargo.toml means source is present) builds and runs
+# target/debug, so you always exercise your local code. Otherwise — the `nix run`
+# case, where the script is a store copy with no Cargo.toml beside it — we take the
+# binaries off PATH. An explicit FLIGHTS_*_BIN wins over both.
+server_bin="${FLIGHTS_SERVER_BIN:-}"
+tui_bin="${FLIGHTS_TUI_BIN:-}"
+if [[ -z "$server_bin" || -z "$tui_bin" ]]; then
+  root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  if [[ -f "$root/Cargo.toml" ]] && command -v cargo >/dev/null 2>&1; then
+    echo "flights-radar: building flights-server + flights (cargo)…" >&2
+    cargo build --manifest-path "$root/Cargo.toml" -p flights-server -p flights-tui
+    server_bin="${server_bin:-$root/target/debug/flights-server}"
+    tui_bin="${tui_bin:-$root/target/debug/flights}"
+  elif command -v flights-server >/dev/null 2>&1 && command -v flights >/dev/null 2>&1; then
+    server_bin="${server_bin:-$(command -v flights-server)}"
+    tui_bin="${tui_bin:-$(command -v flights)}"
+  else
+    echo "flights-radar: no 'flights-server'/'flights' on PATH and no cargo workspace to build." >&2
+    exit 1
+  fi
+fi
+
+# A Server is "up" once /meta answers (the TUI needs Meta before it can draw anyway).
+reachable() { curl -fsS --max-time 2 "$url/meta" >/dev/null 2>&1; }
+
+# Tear down only a Server we started; a reused one is left for whatever else uses it.
+started_pid=""
+cleanup() {
+  if [[ -n "$started_pid" ]] && kill -0 "$started_pid" 2>/dev/null; then
+    kill "$started_pid" 2>/dev/null || true
+    wait "$started_pid" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+if reachable; then
+  echo "flights-radar: reusing the flights-server already at $url" >&2
+else
+  log="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/flights.log"
+  echo "flights-radar: starting flights-server (logging to $log)…" >&2
+  # Output goes to the log, never the terminal — the radar owns the TTY in raw mode
+  # and the Server's startup chatter would corrupt it.
+  read -ra server_args <<<"${FLIGHTS_SERVER_ARGS:-}"
+  if ((${#server_args[@]})); then
+    "$server_bin" "${server_args[@]}" >"$log" 2>&1 &
+  else
+    "$server_bin" >"$log" 2>&1 &
+  fi
+  started_pid=$!
+
+  # Wait for it to bind (or die) before entering the TUI, so a startup failure
+  # surfaces here with the log rather than as a blank radar. ~5s, matching the
+  # TUI's own startup grace window.
+  for ((i = 0; i < 50; i++)); do
+    if reachable; then break; fi
+    if ! kill -0 "$started_pid" 2>/dev/null; then
+      echo "flights-radar: flights-server exited during startup — last lines of $log:" >&2
+      tail -n 20 "$log" >&2 || true
+      exit 1
+    fi
+    sleep 0.1
+  done
+  if ! reachable; then
+    echo "flights-radar: flights-server did not come up within 5s. See $log." >&2
+    exit 1
+  fi
+fi
+
+# The radar in the foreground. On exit the trap stops any Server we spawned.
+if ((${#tui_args[@]})); then
+  "$tui_bin" "${tui_args[@]}"
+else
+  "$tui_bin"
+fi

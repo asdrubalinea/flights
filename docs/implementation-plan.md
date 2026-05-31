@@ -91,6 +91,13 @@ flights-tui/             – ratatui radar, thin client            (bin `flights
                            popup; remote data, renders DetailGroups verbatim)
 
 waybar/                  – shell one-liner: curl 127.0.0.1:7878/nearest | jq …
+
+scripts/
+  flights-radar          – launch Server + radar TUI together (one command); starts
+                           flights-server in the background, waits for /meta, runs the
+                           TUI in front, and stops only a Server it started — reusing
+                           any already running, never spawning a second poller.
+                           `nix run .#radar`; on PATH in the dev shell.
 ```
 
 Everything above `sources/` depends only on `domain` + the trait. Inside the Server
