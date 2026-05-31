@@ -1,38 +1,27 @@
 //! The poller: a single background thread that owns the active Source, decides
-//! its own poll cadence, and streams updates to the UI over a one-way channel
-//! (ADR-0002). It never refreshes for the screen — the UI dead-reckons between
-//! polls — so request volume tracks how *interesting* the airspace is.
+//! its own poll cadence, and writes each fresh Snapshot into the shared
+//! [`Tracker`] (ADR-0002). It never refreshes for any screen — Clients
+//! dead-reckon the held Snapshot on read — so request volume tracks how
+//! *interesting* the airspace is, not how many Clients are watching.
 //!
-//! Cadence is bounded **below** by the Source's `min_interval()` (the rate-limit
-//! floor) and **above** by the configured max (kept under Search-area transit
-//! time). Between those, the poll interval shrinks as the Pacing flight's CPA
-//! approaches. On error the poller backs off exponentially, honoring an explicit
-//! `Retry-After` when the Source supplies one.
+//! After ingesting a Snapshot the poller reads the Tracker back to find the
+//! current Pacing flight, which sets the next interval. Cadence is bounded
+//! **below** by the Source's `min_interval()` (the rate-limit floor) and **above**
+//! by the configured max (kept under Search-area transit time). Between those, the
+//! poll interval shrinks as the Pacing flight's CPA approaches. On error the
+//! poller backs off exponentially, honoring an explicit `Retry-After` when the
+//! Source supplies one, and notes the error on the Tracker so it can surface as
+//! `stale` once the held Snapshot ages out.
 
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::domain::{SearchArea, Snapshot};
+use crate::domain::SearchArea;
 use crate::geo::Cpa;
 use crate::sources::{FlightSource, SourceError};
-use crate::tracker::{Tracker, TrackerConfig};
-
-/// A one-way message from the poller to the UI. Each carries the cadence the
-/// poller chose, so the status line (and the headless run) can show the adaptive
-/// pacing at work without a back-channel.
-pub enum PollUpdate {
-    Snapshot {
-        snapshot: Snapshot,
-        /// How long until the poller's next fetch.
-        next_interval: Duration,
-    },
-    Error {
-        error: SourceError,
-        /// How long the poller will back off before retrying.
-        retry_in: Duration,
-    },
-}
+use crate::tracker::Tracker;
 
 /// The poll-interval window: `[min, max]`. `min` is the Source's floor; `max` is
 /// the quiet-airspace cadence (configured, below transit time).
@@ -87,7 +76,11 @@ impl Backoff {
             retry_after: Some(d),
         } = error
         {
-            return (*d).clamp(bounds.min, RETRY_AFTER_CEILING);
+            // Clamp into `[min, ceiling]`, but never let the floor exceed the
+            // ceiling: a misconfigured `source.min_interval_ms` above the ceiling
+            // would otherwise make `Duration::clamp` panic (min > max).
+            let lo = bounds.min.min(RETRY_AFTER_CEILING);
+            return (*d).clamp(lo, RETRY_AFTER_CEILING);
         }
 
         let factor = 2u32.saturating_pow(self.failures - 1);
@@ -95,23 +88,23 @@ impl Backoff {
     }
 }
 
-/// Spawn the poller thread. Returns its join handle and a shutdown handle; drop
-/// or signal the handle to stop the thread between polls.
+/// Spawn the poller thread, writing into the shared [`Tracker`]. Returns its join
+/// handle and a shutdown handle; drop the shutdown handle (or signal it) to stop
+/// the thread between polls.
 pub fn spawn(
     source: Box<dyn FlightSource>,
     area: SearchArea,
     bounds: PollBounds,
-    tracker_cfg: TrackerConfig,
-    updates: Sender<PollUpdate>,
+    tracker: Arc<RwLock<Tracker>>,
 ) -> (JoinHandle<()>, Shutdown) {
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
     let handle = thread::spawn(move || {
-        run(source, area, bounds, tracker_cfg, updates, &stop_rx);
+        run(source, area, bounds, tracker, &stop_rx);
     });
     (handle, Shutdown { _tx: stop_tx })
 }
 
-/// Dropping this (or letting the UI exit) wakes the poller and ends its loop.
+/// Dropping this (or signalling it) wakes the poller and ends its loop.
 pub struct Shutdown {
     _tx: Sender<()>,
 }
@@ -120,13 +113,9 @@ fn run(
     source: Box<dyn FlightSource>,
     area: SearchArea,
     bounds: PollBounds,
-    tracker_cfg: TrackerConfig,
-    updates: Sender<PollUpdate>,
+    tracker: Arc<RwLock<Tracker>>,
     stop_rx: &Receiver<()>,
 ) {
-    // A private tracker, used only to compute the Pacing flight from each fresh
-    // Snapshot via the same relevance/soonest logic the UI uses.
-    let mut tracker = Tracker::new(area, tracker_cfg);
     let mut backoff = Backoff::default();
 
     loop {
@@ -134,25 +123,15 @@ fn run(
             Ok(snapshot) => {
                 backoff.reset();
                 let now = snapshot.taken_at;
-                tracker.ingest(snapshot.clone());
-                let pacing = tracker.pacing_at(now).and_then(|t| t.cpa);
-                let next_interval = schedule(pacing, bounds);
-                if updates
-                    .send(PollUpdate::Snapshot {
-                        snapshot,
-                        next_interval,
-                    })
-                    .is_err()
-                {
-                    break; // UI gone
-                }
-                next_interval
+                // Ingest under the write lock, then drop it before the (cloning)
+                // pacing computation so handler threads aren't blocked on it.
+                write(&tracker).ingest(snapshot);
+                let pacing = read(&tracker).pacing_at(now).and_then(|t| t.cpa);
+                schedule(pacing, bounds)
             }
             Err(error) => {
                 let retry_in = backoff.next_delay(&error, bounds);
-                if updates.send(PollUpdate::Error { error, retry_in }).is_err() {
-                    break;
-                }
+                write(&tracker).note_error(error.to_string());
                 retry_in
             }
         };
@@ -162,6 +141,17 @@ fn run(
             _ => break,                                 // shutdown requested or channel closed
         }
     }
+}
+
+/// Take the Tracker's write lock, recovering from a poisoned lock so one panicked
+/// handler thread can't wedge the poller. The data stays coherent: a single
+/// `ingest`/`note_error` either fully applied or did not.
+fn write(tracker: &RwLock<Tracker>) -> RwLockWriteGuard<'_, Tracker> {
+    tracker.write().unwrap_or_else(|e| e.into_inner())
+}
+
+fn read(tracker: &RwLock<Tracker>) -> RwLockReadGuard<'_, Tracker> {
+    tracker.read().unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(test)]
@@ -239,6 +229,25 @@ mod tests {
                 retry_after: Some(Duration::from_secs(9999)),
             },
             bounds(),
+        );
+        assert_eq!(d, RETRY_AFTER_CEILING);
+    }
+
+    #[test]
+    fn retry_after_with_a_floor_above_the_ceiling_does_not_panic() {
+        // A (mis)configured source min_interval above RETRY_AFTER_CEILING once made
+        // the retry-after clamp panic (min > max). It must instead pin to the
+        // ceiling rather than abort the poller.
+        let bounds = PollBounds {
+            min: Duration::from_secs(600), // above the 300 s ceiling
+            max: Duration::from_secs(600),
+        };
+        let mut b = Backoff::default();
+        let d = b.next_delay(
+            &SourceError::RateLimited {
+                retry_after: Some(Duration::from_secs(30)),
+            },
+            bounds,
         );
         assert_eq!(d, RETRY_AFTER_CEILING);
     }

@@ -1,0 +1,19 @@
+[package]
+name = "flights-tui"
+description = "Radar-style TUI — a thin Client that renders the flights Server's REST API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "flights"
+path = "src/main.rs"
+
+[dependencies]
+flights-api = { workspace = true }
+ratatui = { workspace = true }    # crossterm backend default
+ureq = { workspace = true }       # talks to the Server, not a Source
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }       # client config (server URL, fps)
+anyhow = { workspace = true }

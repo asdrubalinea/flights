@@ -1,8 +1,9 @@
 //! Drawing. One frame = a north-up radar canvas on the left, a flight list and a
-//! status block on the right. Everything is derived from a single set of tracks
-//! dead-reckoned to one instant, so the radar, list, and status never disagree.
-
-use std::time::Instant;
+//! status block on the right. Everything is derived from a single
+//! [`flights_api::PictureResponse`] the Server computed, so the radar, list, and
+//! status never disagree — the Client only renders, it never recomputes geometry
+//! (ADR-0005). The detail popup renders the lazily-fetched
+//! [`flights_api::FlightDetail`], whose opaque groups are shown verbatim.
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -12,11 +13,9 @@ use ratatui::widgets::canvas::{Canvas, Circle, Line as CanvasLine, Points};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::domain::VerticalTrend;
-use crate::tracker::{Health, Track};
-use crate::{fmt_pacing, fmt_position, label};
+use flights_api::{Cpa, DetailGroup, Flight, FlightDetail, VerticalTrend};
 
-use super::app::{App, Mode};
+use super::app::{App, Conn, DetailView, Mode};
 
 const RING_FRACTIONS: [f64; 3] = [1.0 / 3.0, 2.0 / 3.0, 1.0];
 
@@ -25,15 +24,16 @@ const RING_FRACTIONS: [f64; 3] = [1.0 / 3.0, 2.0 / 3.0, 1.0];
 /// in every direction — otherwise the range rings render as ovals.
 const CELL_ASPECT: f64 = 2.0;
 
+/// Groundspeed below this (knots) is treated as stationary: no heading vector.
+/// Mirrors the Server's domain floor — purely a display threshold here.
+const MOVING_FLOOR_KT: f64 = 1.0;
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let now = Instant::now();
-    // One dead-reckoning pass feeds the whole frame, so the radar, list, and
-    // status can't disagree about who is nearest, pacing, or even present.
-    let picture = app.tracker.picture_at(now);
-    let nearest_hex = picture.nearest().map(|t| t.flight.hex.clone());
-    let pacing_hex = picture.pacing().map(|t| t.flight.hex.clone());
-    let tracks = &picture.tracks;
-    let health = &picture.health;
+    // The Server already produced one self-consistent picture; we just render it.
+    let tracks: Vec<Flight> = app.tracks().to_vec();
+    let nearest_hex = tracks.first().map(|f| f.hex.clone());
+    let pacing_hex = app.picture.as_ref().and_then(|p| p.pacing_hex.clone());
+    let radius = app.meta.radius_nm;
 
     let [radar_area, panel] =
         Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
@@ -44,8 +44,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_radar(
         frame,
         radar_area,
-        app.area.radius_nm,
-        tracks,
+        radius,
+        &tracks,
         nearest_hex.clone(),
         pacing_hex.clone(),
         app.selected_hex.clone(),
@@ -53,7 +53,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_list(
         frame,
         list_area,
-        tracks,
+        &tracks,
         pacing_hex.as_deref(),
         app.selected_hex.as_deref(),
         &mut app.list_state,
@@ -62,19 +62,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         frame,
         status_area,
         app,
-        tracks,
-        health,
-        now,
+        &tracks,
         nearest_hex.as_deref(),
         pacing_hex.as_deref(),
         app.selected_hex.as_deref(),
     );
 
-    // The flight-detail popup layers over the dimmed radar+list. Clone the
-    // selection so the scroll offset can be borrowed mutably for clamping.
+    // The flight-detail popup layers over the dimmed radar+list.
     if app.mode == Mode::Detail {
-        let selected = app.selected_hex.clone();
-        draw_detail(frame, tracks, selected.as_deref(), &mut app.detail_scroll);
+        let detail = app.detail.clone();
+        draw_detail(frame, detail.as_ref(), &mut app.detail_scroll);
     }
 }
 
@@ -82,7 +79,7 @@ fn draw_radar(
     frame: &mut Frame,
     area: Rect,
     radius: f64,
-    tracks: &[Track],
+    tracks: &[Flight],
     nearest_hex: Option<String>,
     pacing_hex: Option<String>,
     selected_hex: Option<String>,
@@ -100,6 +97,7 @@ fn draw_radar(
         (radius, radius / pixel_aspect)
     };
 
+    let tracks = tracks.to_vec();
     let canvas = Canvas::default()
         .block(Block::bordered().title(" radar · north-up "))
         .x_bounds([-x_extent, x_extent])
@@ -133,10 +131,10 @@ fn draw_radar(
             ctx.layer();
 
             // Blips with heading vectors.
-            for t in tracks {
+            for t in &tracks {
                 let (x, y) = radar_xy(t);
                 let color = blip_color(t, &nearest_hex, &pacing_hex, &selected_hex);
-                if let Some((track, gs)) = t.flight.velocity() {
+                if let Some((track, gs)) = velocity(t) {
                     let len = (radius * 0.05 * (gs / 300.0)).clamp(radius * 0.02, radius * 0.12);
                     let a = track.to_radians();
                     ctx.draw(&CanvasLine {
@@ -166,7 +164,7 @@ fn draw_radar(
 
             // Labels only on flagged flights (nearest / pacing / selected) so the
             // scope doesn't turn into a wall of text.
-            for t in tracks {
+            for t in &tracks {
                 if !is_flagged(t, &nearest_hex, &pacing_hex, &selected_hex) {
                     continue;
                 }
@@ -175,7 +173,7 @@ fn draw_radar(
                 ctx.print(
                     x + radius * 0.03,
                     y,
-                    Line::from(Span::styled(label(&t.flight), Style::new().fg(color))),
+                    Line::from(Span::styled(label(t), Style::new().fg(color))),
                 );
             }
         });
@@ -185,7 +183,7 @@ fn draw_radar(
 fn draw_list(
     frame: &mut Frame,
     area: Rect,
-    tracks: &[Track],
+    tracks: &[Flight],
     pacing_hex: Option<&str>,
     selected_hex: Option<&str>,
     state: &mut ListState,
@@ -202,43 +200,42 @@ fn draw_list(
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▶ ");
 
-    let index = selected_hex.and_then(|hex| tracks.iter().position(|t| t.flight.hex == hex));
+    let index = selected_hex.and_then(|hex| tracks.iter().position(|t| t.hex == hex));
     state.select(index);
     frame.render_stateful_widget(list, area, state);
 }
 
-fn list_row(t: &Track, pacing_hex: Option<&str>, max_width: u16) -> Line<'static> {
-    let is_pacing = Some(t.flight.hex.as_str()) == pacing_hex;
+fn list_row(t: &Flight, pacing_hex: Option<&str>, max_width: u16) -> Line<'static> {
+    let is_pacing = Some(t.hex.as_str()) == pacing_hex;
     let ident_style = if is_pacing {
         Style::new()
             .fg(Color::LightRed)
             .add_modifier(Modifier::BOLD)
-    } else if t.flight.ident.is_none() {
+    } else if t.ident.is_none() {
         Style::new().fg(Color::DarkGray)
     } else {
         Style::new()
     };
 
     let alt = t
-        .flight
         .altitude_ft
         .map(|a| format!("{a:.0}ft"))
         .unwrap_or_else(|| "?".into());
 
     // The ICAO type designator (e.g. B738), dimmed so it reads as secondary to
-    // the callsign. Blank when the Source didn't supply one.
-    let kind = t.flight.aircraft_type.as_deref().unwrap_or("");
+    // the callsign. Blank when the Server didn't supply one.
+    let kind = t.aircraft_type.as_deref().unwrap_or("");
 
-    // Climb/descend/level glyph glued to the altitude.
-    let (glyph, glyph_color) = trend_glyph(t.flight.vertical_trend());
+    // Climb/descend/level glyph glued to the altitude (the Server derived the trend).
+    let (glyph, glyph_color) = trend_glyph(t.vertical_trend);
 
-    let gs_span = match t.flight.groundspeed_kt {
+    let gs_span = match t.groundspeed_kt {
         Some(g) => Span::raw(format!(" {g:>3.0}kt")),
         None => Span::raw(String::new()),
     };
 
-    let (arrow, arrow_color, cpa) = match t.cpa {
-        Some(c) if c.is_approaching() => (
+    let (arrow, arrow_color, cpa) = match &t.cpa {
+        Some(c) if approaching(c) => (
             "▲",
             Color::Green,
             format!("{:.0}nm/{:.0}s", c.cpa_distance_nm, c.time_to_cpa_s),
@@ -256,7 +253,7 @@ fn list_row(t: &Track, pacing_hex: Option<&str>, max_width: u16) -> Line<'static
     let groups = vec![
         (
             0,
-            vec![Span::styled(format!("{:<8}", label(&t.flight)), ident_style)],
+            vec![Span::styled(format!("{:<8}", label(t)), ident_style)],
         ),
         (
             4,
@@ -269,7 +266,7 @@ fn list_row(t: &Track, pacing_hex: Option<&str>, max_width: u16) -> Line<'static
             1,
             vec![Span::raw(format!(
                 " {:>5.1}nm {:03.0}°",
-                t.distance_nm, t.bearing_from_home
+                t.distance_nm, t.bearing_deg
             ))],
         ),
         (
@@ -334,53 +331,54 @@ fn draw_status(
     frame: &mut Frame,
     area: Rect,
     app: &App,
-    tracks: &[Track],
-    health: &Health,
-    now: Instant,
+    tracks: &[Flight],
     nearest_hex: Option<&str>,
     pacing_hex: Option<&str>,
     selected_hex: Option<&str>,
 ) {
-    let (state_label, state_color, health_error) = match health {
-        Health::Live => ("LIVE", Color::Green, None),
-        Health::Stale { last_error } => ("STALE", Color::Yellow, last_error.as_deref()),
-        Health::NoData { last_error } => ("NO DATA", Color::Red, last_error.as_deref()),
+    // The Client's "server unreachable" state takes precedence over the Server's
+    // own health (which we can't trust once we can't reach it).
+    let (state_label, state_color, status_error) = match &app.conn {
+        Conn::Down(e) => ("UNREACHABLE", Color::Red, Some(e.clone())),
+        Conn::Ok => match &app.picture {
+            Some(p) => match p.health {
+                flights_api::Health::Live => ("LIVE", Color::Green, None),
+                flights_api::Health::Stale => ("STALE", Color::Yellow, p.last_error.clone()),
+                flights_api::Health::NoData => ("NO DATA", Color::Red, p.last_error.clone()),
+            },
+            None => ("NO DATA", Color::Red, None),
+        },
     };
+
     let age = app
-        .tracker
-        .snapshot_age(now)
-        .map(|d| format!("{:.0}s ago", d.as_secs_f64()))
+        .picture
+        .as_ref()
+        .and_then(|p| p.snapshot_age_s)
+        .map(|s| format!("{s:.0}s ago"))
         .unwrap_or_else(|| "—".into());
 
-    let find = |hex: Option<&str>| hex.and_then(|h| tracks.iter().find(|t| t.flight.hex == h));
+    let find = |hex: Option<&str>| hex.and_then(|h| tracks.iter().find(|t| t.hex == h));
     let nearest = find(nearest_hex)
         .map(fmt_position)
         .unwrap_or_else(|| "(none)".into());
     let pacing = find(pacing_hex)
         .map(fmt_pacing)
         .unwrap_or_else(|| "quiet — backing off".into());
-    let countdown = app
-        .next_poll_at
-        .map(|t| format!("{:.1}s", t.saturating_duration_since(now).as_secs_f64()))
-        .unwrap_or_else(|| "—".into());
 
-    // The selected flight's live (dead-reckoned) coordinates and how old the
-    // underlying position report now is — useful for cross-referencing.
+    // The selected flight's live (Server-dead-reckoned) coordinates and how old
+    // the underlying position report now is — useful for cross-referencing.
     let selected = find(selected_hex).map(|t| {
-        // Prefer the full model description; fall back to the type code, then to
-        // a placeholder when the Source gave us neither.
         let model = t
-            .flight
             .model
             .as_deref()
-            .or(t.flight.aircraft_type.as_deref())
+            .or(t.aircraft_type.as_deref())
             .unwrap_or("unknown type");
         format!(
             "sel {} · {model}  {:.3}, {:.3}  ({:.0}s old)",
-            label(&t.flight),
-            t.estimated.lat,
-            t.estimated.lon,
-            t.age.as_secs_f64()
+            label(t),
+            t.lat,
+            t.lon,
+            t.age_s
         )
     });
 
@@ -388,7 +386,7 @@ fn draw_status(
         Line::from(vec![
             Span::raw("source "),
             Span::styled(
-                app.source_name.clone(),
+                app.meta.source.clone(),
                 Style::new().add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
@@ -400,10 +398,7 @@ fn draw_status(
         ]),
         Line::from(format!("nearest  {nearest}")),
         Line::from(format!("pacing   {pacing}")),
-        Line::from(format!(
-            "next poll in {countdown}   relevance {:.0}nm",
-            app.relevance_nm
-        )),
+        Line::from(format!("relevance {:.0}nm", app.meta.relevance_nm)),
     ];
     match selected {
         Some(s) => lines.push(Line::from(Span::styled(s, Style::new().fg(Color::White)))),
@@ -412,7 +407,7 @@ fn draw_status(
             Style::new().fg(Color::DarkGray),
         ))),
     }
-    if let Some(err) = health_error {
+    if let Some(err) = status_error {
         lines.push(Line::from(Span::styled(
             format!("! {err}"),
             Style::new().fg(Color::Red),
@@ -425,11 +420,11 @@ fn draw_status(
     );
 }
 
-/// The flight-detail popup: dim the frame, clear a centered box, and fill it with
-/// the inspected flight's data — or a "left the area" notice if it has dropped out
-/// of the Search area while the popup was open (never fabricated values). The key
-/// hints sit on a fixed bottom line so scrolling the body never loses them.
-fn draw_detail(frame: &mut Frame, tracks: &[Track], selected_hex: Option<&str>, scroll: &mut u16) {
+/// The flight-detail popup: dim the frame, clear a centered box, and fill it from
+/// the lazily-fetched [`FlightDetail`] — or a "left the area" / error notice when
+/// the flight has dropped out or the fetch failed (never fabricated values). The
+/// key hints sit on a fixed bottom line so scrolling the body never loses them.
+fn draw_detail(frame: &mut Frame, detail: Option<&DetailView>, scroll: &mut u16) {
     let full = frame.area();
     frame
         .buffer_mut()
@@ -447,25 +442,29 @@ fn draw_detail(frame: &mut Frame, tracks: &[Track], selected_hex: Option<&str>, 
     let [body_area, footer_area] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
 
-    let track = selected_hex.and_then(|h| tracks.iter().find(|t| t.flight.hex == h));
-    let (body, footer) = match track {
-        Some(t) => (detail_lines(t), "Esc close · ↑/↓ flight · PgUp/PgDn scroll"),
-        None => (
-            vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  — flight left the area —",
-                    Style::new().fg(Color::DarkGray),
-                )),
-            ],
+    let (body, footer) = match detail {
+        Some(DetailView::Loaded(detail)) => (
+            detail_lines(detail),
+            "Esc close · ↑/↓ flight · PgUp/PgDn scroll",
+        ),
+        Some(DetailView::LeftArea) => (
+            notice("— flight left the area —"),
             "Esc close · ↑/↓ next flight",
         ),
+        Some(DetailView::Error(e)) => (notice(&format!("— {e} —")), "Esc close"),
+        None => (notice("— loading… —"), "Esc close"),
     };
 
     // Clamp so the body can't be scrolled entirely past the viewport, leaving a
-    // void below it. Bounds against the logical line count (the detail fields are
-    // short and never wrap at the popup width, so this matches the rendered height).
-    let max_scroll = (body.len() as u16).saturating_sub(body_area.height);
+    // void below it. The promoted fields are short, but an opaque adapter detail
+    // value can be long and wrap, so we bound against the *rendered* row count (how
+    // many rows the body occupies once word-wrapped) rather than the logical line
+    // count — otherwise the bottom of a wrapped popup stays unreachable.
+    let rendered_rows: u16 = body
+        .iter()
+        .map(|line| wrapped_rows(line, body_area.width))
+        .fold(0u16, |acc, r| acc.saturating_add(r));
+    let max_scroll = rendered_rows.saturating_sub(body_area.height);
     *scroll = (*scroll).min(max_scroll);
 
     frame.render_widget(
@@ -483,11 +482,22 @@ fn draw_detail(frame: &mut Frame, tracks: &[Track], selected_hex: Option<&str>, 
     );
 }
 
+/// A two-line centered placeholder body for the popup's non-loaded states.
+fn notice(text: &str) -> Vec<Line<'static>> {
+    vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {text}"),
+            Style::new().fg(Color::DarkGray),
+        )),
+    ]
+}
+
 /// Every displayable field for one flight: a header, the promoted typed fields
-/// grouped under "Position & motion" / "Transponder", then the Source-contributed
-/// [`crate::domain::DetailGroup`]s rendered generically (no per-Source code).
-fn detail_lines(t: &Track) -> Vec<Line<'static>> {
-    let f = &t.flight;
+/// grouped under "Position & motion" / "Transponder", then the Server-contributed
+/// [`DetailGroup`]s rendered generically (no per-Source code).
+fn detail_lines(detail: &FlightDetail) -> Vec<Line<'static>> {
+    let f = &detail.flight;
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     lines.push(Line::from(Span::styled(
@@ -514,8 +524,8 @@ fn detail_lines(t: &Track) -> Vec<Line<'static>> {
     }
 
     section_title(&mut lines, "Position & motion");
-    lines.push(field_line("Distance", &format!("{:.1} nm", t.distance_nm)));
-    lines.push(field_line("Bearing", &format!("{:03.0}°", t.bearing_from_home)));
+    lines.push(field_line("Distance", &format!("{:.1} nm", f.distance_nm)));
+    lines.push(field_line("Bearing", &format!("{:03.0}°", f.bearing_deg)));
     if let Some(a) = f.altitude_ft {
         lines.push(field_line("Baro alt", &format!("{a:.0} ft")));
     }
@@ -523,7 +533,7 @@ fn detail_lines(t: &Track) -> Vec<Line<'static>> {
         lines.push(field_line("Geo alt", &format!("{a:.0} ft")));
     }
     if let Some(r) = f.vertical_rate_fpm {
-        let (glyph, _) = trend_glyph(f.vertical_trend());
+        let (glyph, _) = trend_glyph(f.vertical_trend);
         lines.push(field_line("Vertical rate", &format!("{r:+.0} fpm {glyph}")));
     }
     if let Some(g) = f.groundspeed_kt {
@@ -534,12 +544,9 @@ fn detail_lines(t: &Track) -> Vec<Line<'static>> {
     }
     lines.push(field_line(
         "Position",
-        &format!("{:.4}, {:.4}", t.estimated.lat, t.estimated.lon),
+        &format!("{:.4}, {:.4}", f.lat, f.lon),
     ));
-    lines.push(field_line(
-        "Position age",
-        &format!("{:.0}s", t.age.as_secs_f64()),
-    ));
+    lines.push(field_line("Position age", &format!("{:.0}s", f.age_s)));
 
     if f.squawk.is_some() || f.emergency.is_some() {
         section_title(&mut lines, "Transponder");
@@ -551,15 +558,19 @@ fn detail_lines(t: &Track) -> Vec<Line<'static>> {
         }
     }
 
-    // The opaque, Source-formatted detail groups — rendered verbatim.
-    for group in &f.details {
-        section_title(&mut lines, &group.title);
-        for (label, value) in &group.fields {
-            lines.push(field_line(label, value));
-        }
+    // The opaque, Server-formatted detail groups — rendered verbatim.
+    for group in &detail.details {
+        render_group(&mut lines, group);
     }
 
     lines
+}
+
+fn render_group(lines: &mut Vec<Line<'static>>, group: &DetailGroup) {
+    section_title(lines, &group.title);
+    for field in &group.fields {
+        lines.push(field_line(&field.label, &field.value));
+    }
 }
 
 /// A blank spacer then a styled section heading.
@@ -574,12 +585,49 @@ fn section_title(lines: &mut Vec<Line<'static>>, title: &str) {
 /// One `label   value` row inside the popup.
 fn field_line(label: &str, value: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(
-            format!("  {label:<16}"),
-            Style::new().fg(Color::DarkGray),
-        ),
+        Span::styled(format!("  {label:<16}"), Style::new().fg(Color::DarkGray)),
         Span::raw(value.to_string()),
     ])
+}
+
+/// How many terminal rows a logical line occupies once word-wrapped to `width`
+/// (as the popup body's `Wrap { trim: false }` renders it). A greedy model: words
+/// are separated by single spaces, an over-long word is hard-broken across rows.
+/// A line that fits returns 1, so for the common (non-wrapping) popup this equals
+/// the logical line count — it only diverges when an opaque detail value is long.
+fn wrapped_rows(line: &Line, width: u16) -> u16 {
+    let width = width.max(1) as usize;
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    // Rows added, and the end column, when a word is laid out from column 0 —
+    // hard-breaking it across rows when it is wider than the line.
+    let from_start = |wlen: usize| -> (usize, usize) {
+        if wlen == 0 {
+            (0, 0)
+        } else {
+            ((wlen - 1) / width, (wlen - 1) % width + 1)
+        }
+    };
+
+    let mut rows: usize = 1;
+    let mut col: usize = 0;
+    for word in text.split(' ') {
+        let wlen = word.chars().count();
+        if col == 0 {
+            let (extra, end) = from_start(wlen);
+            rows += extra;
+            col = end;
+        } else if col + 1 + wlen <= width {
+            // Fits on the current row after a separating space.
+            col += 1 + wlen;
+        } else {
+            // Wrap to a fresh row, then lay the word out from column 0.
+            rows += 1;
+            let (extra, end) = from_start(wlen);
+            rows += extra;
+            col = end;
+        }
+    }
+    rows as u16
 }
 
 /// A box of `pct_x`×`pct_y` percent of `area`, capped at `max_x`×`max_y` cells,
@@ -599,31 +647,81 @@ fn centered_rect(area: Rect, pct_x: u16, pct_y: u16, max_x: u16, max_y: u16) -> 
     }
 }
 
+/// A display label: the callsign, or the bracketed hex for an ident-blocked flight.
+fn label(f: &Flight) -> String {
+    f.ident.clone().unwrap_or_else(|| format!("[{}]", f.hex))
+}
+
+/// A flight's velocity as `(track_deg, groundspeed_kt)` when usably moving, for the
+/// radar heading vector. `None` ⇒ no vector drawn.
+fn velocity(f: &Flight) -> Option<(f64, f64)> {
+    match (f.track_deg, f.groundspeed_kt) {
+        (Some(track), Some(gs)) if gs >= MOVING_FLOOR_KT => Some((track, gs)),
+        _ => None,
+    }
+}
+
+/// A flight whose closest pass is still ahead of it (the Server signs it via
+/// `time_to_cpa_s`).
+fn approaching(c: &Cpa) -> bool {
+    c.time_to_cpa_s >= 0.0
+}
+
+fn fmt_position(f: &Flight) -> String {
+    let alt = f
+        .altitude_ft
+        .map(|a| format!("{a:.0} ft"))
+        .unwrap_or_else(|| "alt ?".into());
+    let kind = f
+        .aircraft_type
+        .as_deref()
+        .map(|k| format!(" {k}"))
+        .unwrap_or_default();
+    format!(
+        "{}{kind} — {:.1} nm @ {:03.0}° ({alt})",
+        label(f),
+        f.distance_nm,
+        f.bearing_deg
+    )
+}
+
+fn fmt_pacing(f: &Flight) -> String {
+    match &f.cpa {
+        Some(c) => format!(
+            "{} — CPA {:.1} nm in {:.0}s",
+            label(f),
+            c.cpa_distance_nm,
+            c.time_to_cpa_s
+        ),
+        None => label(f),
+    }
+}
+
 /// A flight's radar position as (east, north) nm offsets from Home.
-fn radar_xy(t: &Track) -> (f64, f64) {
-    let b = t.bearing_from_home.to_radians();
-    (t.distance_nm * b.sin(), t.distance_nm * b.cos())
+fn radar_xy(f: &Flight) -> (f64, f64) {
+    let b = f.bearing_deg.to_radians();
+    (f.distance_nm * b.sin(), f.distance_nm * b.cos())
 }
 
 fn is_flagged(
-    t: &Track,
+    f: &Flight,
     nearest: &Option<String>,
     pacing: &Option<String>,
     selected: &Option<String>,
 ) -> bool {
-    let hex = Some(t.flight.hex.clone());
+    let hex = Some(f.hex.clone());
     hex == *nearest || hex == *pacing || hex == *selected
 }
 
 /// Blip color by priority: selected, then pacing, then nearest, then approach
 /// state. Anonymous (ident-blocked) flights are dimmed unless flagged.
 fn blip_color(
-    t: &Track,
+    f: &Flight,
     nearest: &Option<String>,
     pacing: &Option<String>,
     selected: &Option<String>,
 ) -> Color {
-    let hex = t.flight.hex.as_str();
+    let hex = f.hex.as_str();
     if selected.as_deref() == Some(hex) {
         return Color::White;
     }
@@ -633,11 +731,11 @@ fn blip_color(
     if nearest.as_deref() == Some(hex) {
         return Color::Cyan;
     }
-    if t.flight.ident.is_none() {
+    if f.ident.is_none() {
         return Color::DarkGray;
     }
-    match t.cpa {
-        Some(c) if c.is_approaching() => Color::Green,
+    match &f.cpa {
+        Some(c) if approaching(c) => Color::Green,
         _ => Color::Blue,
     }
 }
@@ -645,14 +743,28 @@ fn blip_color(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Flight, LatLon, SearchArea, Snapshot};
-    use crate::poller::PollUpdate;
-    use crate::tracker::TrackerConfig;
+    use crate::client::Client;
+    use crate::ui::app::{App, DetailView, Mode};
+    use flights_api::{
+        Cpa, DetailField, DetailGroup, Flight, FlightDetail, Health, LatLon, Meta, PictureResponse,
+        Units, VerticalTrend,
+    };
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
-    fn moving(hex: &str, ident: &str, pos: LatLon, track: f64, gs: f64) -> Flight {
+    fn meta() -> Meta {
+        Meta {
+            home: LatLon { lat: 0.0, lon: 0.0 },
+            radius_nm: 100.0,
+            relevance_nm: 30.0,
+            source: "testsrc".into(),
+            units: Units::aviation(),
+            version: "test".into(),
+        }
+    }
+
+    fn flight(hex: &str, ident: &str, distance_nm: f64, bearing_deg: f64) -> Flight {
         Flight {
             hex: hex.into(),
             ident: Some(ident.into()),
@@ -660,80 +772,42 @@ mod tests {
             model: Some("BOEING 737-800".into()),
             registration: None,
             operator: None,
-            position: pos,
+            lat: 0.05,
+            lon: 0.0,
+            distance_nm,
+            bearing_deg,
             altitude_ft: Some(30_000.0),
             geometric_altitude_ft: None,
-            groundspeed_kt: Some(gs),
-            track_deg: Some(track),
+            groundspeed_kt: Some(452.0),
+            track_deg: Some(90.0),
             vertical_rate_fpm: Some(1200.0),
+            vertical_trend: VerticalTrend::Climb,
             squawk: None,
             emergency: None,
             emitter_category: None,
-            reported_age: Duration::ZERO,
-            details: Vec::new(),
+            age_s: 0.0,
+            cpa: Some(Cpa {
+                time_to_cpa_s: 120.0,
+                cpa_distance_nm: 2.0,
+            }),
         }
     }
 
-    /// Render one real frame to an in-memory backend and assert the radar, list,
-    /// and status all painted — the path that can't be driven interactively in CI.
-    #[test]
-    fn draws_radar_list_and_status_with_nearest_and_pacing() {
-        let area = SearchArea {
-            center: LatLon::new(0.0, 0.0),
-            radius_nm: 100.0,
-        };
-        let cfg = TrackerConfig {
-            relevance_distance_nm: 30.0,
-            stale_after: Duration::from_secs(120),
-            max_flight_age: Duration::from_secs(120),
-        };
-        let mut app = App::new(
-            area,
-            cfg,
-            "testsrc".into(),
+    fn app(tracks: Vec<Flight>, pacing_hex: Option<String>) -> App {
+        let mut a = App::new(
+            Client::new("http://127.0.0.1:0"),
+            meta(),
             Duration::from_millis(250),
-            30.0,
         );
-
-        // Overhead but receding → the Nearest flight, not the Pacing flight.
-        let overhead = moving("aaa111", "OVERHEAD", LatLon::new(0.03, 0.0), 0.0, 200.0);
-        // Inbound from the south, CPA imminent and within relevance → Pacing.
-        let inbound = moving("bbb222", "INBOUND", LatLon::new(-0.4, 0.0), 0.0, 400.0);
-        app.on_update(PollUpdate::Snapshot {
-            snapshot: Snapshot::new(vec![overhead, inbound], Instant::now()),
-            next_interval: Duration::from_secs(1),
+        a.picture = Some(PictureResponse {
+            as_of: 0.0,
+            health: Health::Live,
+            last_error: None,
+            snapshot_age_s: Some(1.0),
+            pacing_hex,
+            tracks,
         });
-
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-
-        let text: String = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
-
-        for needle in [
-            "radar", "flights", "status", "testsrc", "LIVE", "nearest", "pacing", "OVERHEAD",
-            "INBOUND", "select", "B738", // the aircraft type code shows in the list
-        ] {
-            assert!(text.contains(needle), "rendered frame missing {needle:?}");
-        }
-    }
-
-    fn test_app() -> App {
-        let area = SearchArea {
-            center: LatLon::new(0.0, 0.0),
-            radius_nm: 100.0,
-        };
-        let cfg = TrackerConfig {
-            relevance_distance_nm: 30.0,
-            stale_after: Duration::from_secs(120),
-            max_flight_age: Duration::from_secs(120),
-        };
-        App::new(area, cfg, "testsrc".into(), Duration::from_millis(250), 30.0)
+        a
     }
 
     fn render_to_text(app: &mut App, w: u16, h: u16) -> String {
@@ -748,25 +822,53 @@ mod tests {
             .collect()
     }
 
-    fn ingest_one(app: &mut App, f: Flight) {
-        app.on_update(PollUpdate::Snapshot {
-            snapshot: Snapshot::new(vec![f], Instant::now()),
-            next_interval: Duration::from_secs(1),
-        });
+    #[test]
+    fn draws_radar_list_and_status_with_nearest_and_pacing() {
+        let overhead = flight("aaa111", "OVERHEAD", 3.0, 0.0);
+        let inbound = flight("bbb222", "INBOUND", 24.0, 180.0);
+        let mut app = app(vec![overhead, inbound], Some("bbb222".into()));
+
+        let text = render_to_text(&mut app, 120, 40);
+        for needle in [
+            "radar", "flights", "status", "testsrc", "LIVE", "nearest", "pacing", "OVERHEAD",
+            "INBOUND", "select", "B738",
+        ] {
+            assert!(text.contains(needle), "rendered frame missing {needle:?}");
+        }
+    }
+
+    #[test]
+    fn shows_server_unreachable_state() {
+        let mut app = app(vec![flight("aaa111", "ALPHA", 3.0, 0.0)], None);
+        app.conn = super::Conn::Down("connection refused".into());
+        let text = render_to_text(&mut app, 120, 40);
+        assert!(
+            text.contains("UNREACHABLE"),
+            "expected the unreachable state"
+        );
+        assert!(
+            text.contains("connection refused"),
+            "expected the error line"
+        );
     }
 
     #[test]
     fn popup_paints_detail_in_detail_mode() {
-        let mut app = test_app();
-        let mut f = moving("sel123", "SELFLT", LatLon::new(0.05, 0.0), 90.0, 452.0);
-        f.registration = Some("N12345".into());
-        f.details = vec![crate::domain::DetailGroup {
-            title: "Signal".into(),
-            fields: vec![("RSSI".into(), "-7.4 dBFS".into())],
-        }];
-        ingest_one(&mut app, f);
+        let mut app = app(vec![flight("sel123", "SELFLT", 3.0, 90.0)], None);
         app.selected_hex = Some("sel123".into());
         app.mode = Mode::Detail;
+        let mut f = flight("sel123", "SELFLT", 3.0, 90.0);
+        f.registration = Some("N12345".into());
+        app.detail = Some(DetailView::Loaded(Box::new(FlightDetail {
+            flight: f,
+            details: vec![DetailGroup {
+                title: "Signal".into(),
+                fields: vec![DetailField {
+                    label: "RSSI".into(),
+                    value: "-7.4 dBFS".into(),
+                }],
+            }],
+        })));
 
         let text = render_to_text(&mut app, 120, 40);
         for needle in [
@@ -783,14 +885,11 @@ mod tests {
     }
 
     #[test]
-    fn popup_shows_left_the_area_when_flight_absent() {
-        let mut app = test_app();
-        ingest_one(
-            &mut app,
-            moving("present", "PRESENT", LatLon::new(0.05, 0.0), 90.0, 300.0),
-        );
-        app.selected_hex = Some("ghost".into()); // never in the Snapshot
+    fn popup_shows_left_the_area() {
+        let mut app = app(vec![flight("present", "PRESENT", 3.0, 0.0)], None);
+        app.selected_hex = Some("ghost".into());
         app.mode = Mode::Detail;
+        app.detail = Some(DetailView::LeftArea);
 
         let text = render_to_text(&mut app, 120, 40);
         assert!(
@@ -801,32 +900,19 @@ mod tests {
 
     #[test]
     fn list_row_survives_a_narrow_terminal() {
-        let mut app = test_app();
-        ingest_one(
-            &mut app,
-            moving("aaa111", "TIGHTONE", LatLon::new(0.05, 0.0), 90.0, 452.0),
-        );
-        // Must not panic; the callsign (highest priority) survives truncation.
-        let text = render_to_text(&mut app, 40, 20);
+        let f = flight("aaa111", "TIGHTONE", 3.0, 90.0);
+        let line = list_row(&f, None, 16);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("TIGHTONE"), "callsign should survive");
     }
 
     #[test]
     fn list_row_drops_altitude_and_its_trend_glyph_together() {
-        // `moving` builds a climbing flight (1200 fpm → "↑") at 30000 ft. Altitude
-        // and its glyph share one fit group, so at a width that can't hold the
-        // altitude the glyph must not survive alone — the bug this grouping fixes.
-        let track = Track {
-            flight: moving("aaa111", "TIGHT", LatLon::new(0.05, 0.0), 90.0, 452.0),
-            estimated: LatLon::new(0.05, 0.0),
-            distance_nm: 3.0,
-            bearing_from_home: 90.0,
-            cpa: None,
-            age: Duration::ZERO,
-        };
-        // Fits the callsign (8) and distance/bearing (13) but not the altitude
-        // group (9); a lone 1-col glyph would otherwise sneak in.
-        let line = list_row(&track, None, 22);
+        // A climbing flight (↑) at 30000 ft. Altitude and its glyph share one fit
+        // group, so at a width that can't hold the altitude the glyph must not
+        // survive alone.
+        let f = flight("aaa111", "TIGHT", 3.0, 90.0);
+        let line = list_row(&f, None, 22);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("TIGHT"), "callsign survives");
         assert!(!text.contains("30000"), "altitude is dropped at this width");
@@ -837,10 +923,23 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_rows_counts_wrap_for_long_lines() {
+        // A line that fits is one row (the common popup case).
+        assert_eq!(wrapped_rows(&Line::from("short value"), 40), 1);
+        assert_eq!(wrapped_rows(&Line::from(""), 40), 1);
+        // A value longer than the width wraps across rows.
+        assert_eq!(wrapped_rows(&Line::from("a".repeat(80)), 40), 2);
+        assert_eq!(wrapped_rows(&Line::from("a".repeat(81)), 40), 3);
+        // Word-boundary wrap: two words that don't share a row.
+        let twenty = "x".repeat(20);
+        assert_eq!(
+            wrapped_rows(&Line::from(format!("{twenty} {twenty}")), 25),
+            2
+        );
+    }
+
+    #[test]
     fn fit_groups_drops_whole_groups_keeping_priority_order() {
-        // Three groups; the priority-2 group has two spans and must be kept or
-        // dropped as a unit. At width 8 the two lowest-number priorities fit and
-        // render in original (display) order; the priority-2 group drops whole.
         let groups = vec![
             (0u8, vec![Span::raw("aaaa")]),
             (2, vec![Span::raw("bb"), Span::raw("BB")]),

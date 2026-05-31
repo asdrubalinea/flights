@@ -1,0 +1,12 @@
+[package]
+name = "flights-api"
+description = "The flights REST wire format — serde DTOs shared by the Server and its Clients"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
