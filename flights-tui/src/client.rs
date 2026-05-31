@@ -33,7 +33,15 @@ impl std::fmt::Display for ClientError {
 
 impl std::error::Error for ClientError {}
 
+/// Default per-request ceiling, used for the one-off `/meta` and `/flight` calls.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Tighter ceiling for the per-frame `/picture` poll. The event loop blocks on
+/// this call every frame, so a Server that is *up but hung* (accepts the socket,
+/// stalls) would otherwise freeze the whole TUI — including the quit key — for the
+/// full [`HTTP_TIMEOUT`]. Bounding it near a frame keeps the UI responsive; a
+/// healthy loopback reply is sub-millisecond, so this only bites a stuck Server.
+const PICTURE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 pub struct Client {
     /// Base URL with no trailing slash, e.g. `http://127.0.0.1:7878`.
@@ -63,12 +71,13 @@ impl Client {
 
     /// `GET /meta` — the unchanging facts, fetched once at startup.
     pub fn meta(&self) -> Result<Meta, ClientError> {
-        self.get_json("/meta")
+        self.get_json("/meta", None)
     }
 
     /// `GET /picture` — the whole airspace at one instant; polled every frame.
+    /// Uses the tighter [`PICTURE_TIMEOUT`] so a hung Server can't freeze the UI.
     pub fn picture(&self) -> Result<PictureResponse, ClientError> {
-        self.get_json("/picture")
+        self.get_json("/picture", Some(PICTURE_TIMEOUT))
     }
 
     /// `GET /flight/{hex}` — full detail for the popup. `Ok(None)` on a `404`,
@@ -96,11 +105,19 @@ impl Client {
         }
     }
 
-    fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, ClientError> {
+    /// A GET that deserializes the JSON body. `timeout`, when set, overrides the
+    /// agent's global ceiling for this one request (see [`PICTURE_TIMEOUT`]).
+    fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        timeout: Option<Duration>,
+    ) -> Result<T, ClientError> {
         let url = format!("{}{path}", self.base_url);
-        let mut resp = self
-            .agent
-            .get(&url)
+        let mut req = self.agent.get(&url);
+        if let Some(t) = timeout {
+            req = req.config().timeout_global(Some(t)).build();
+        }
+        let mut resp = req
             .call()
             .map_err(|e| ClientError::Unreachable(e.to_string()))?;
         match resp.status().as_u16() {

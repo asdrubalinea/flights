@@ -105,6 +105,10 @@ impl Default for Search {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Server {
+    /// `host:port` to bind the REST API to. Prefer a literal IP (the default is
+    /// `127.0.0.1:7878`): a hostname resolving to several addresses binds only the
+    /// first one resolved, so a dual-stack `localhost` could end up listening on
+    /// just one of v4/v6 while a Client reaches for the other.
     pub bind: String,
     /// The value sent in `Access-Control-Allow-Origin`, or `None` to send no CORS
     /// header at all (the default). Loopback only stops the *network* from reaching
@@ -310,6 +314,21 @@ impl Config {
             ));
         }
 
+        // A configured CORS origin is sent verbatim as the `Access-Control-Allow-Origin`
+        // header value, which must be ASCII with no control characters. Reject a bad
+        // one here, on load, rather than letting the per-request header build fail and
+        // panic (ADR-0005): under `panic = "abort"` that would take the whole Server
+        // down on every CORS response. An origin is a URL or `*`, so requiring visible
+        // ASCII (no spaces) is strict on purpose, and it also forecloses header injection.
+        if let Some(origin) = &self.server.cors_allow_origin {
+            if origin.is_empty() || origin.bytes().any(|b| !(0x21..=0x7e).contains(&b)) {
+                return Err(ConfigError::Invalid(format!(
+                    "server.cors_allow_origin {origin:?} is not a valid header value \
+                     (expected an origin URL or \"*\", visible ASCII with no spaces)"
+                )));
+            }
+        }
+
         // The max poll interval must stay below the Search-area transit time, so a
         // fast jet cannot cross the area between polls unseen.
         let transit = self.transit_time().as_secs_f64();
@@ -362,6 +381,7 @@ impl Config {
 
 /// Resolve a `host:port` bind string to a concrete [`SocketAddr`], erroring (not
 /// panicking) on a malformed or unresolvable address so config load can report it.
+/// Takes the first resolved address; see the [`Server`] `bind` note on hostnames.
 fn resolve_bind(bind: &str) -> Result<SocketAddr, ConfigError> {
     bind.to_socket_addrs()
         .map_err(|e| {
@@ -495,6 +515,42 @@ mod tests {
     #[test]
     fn cors_is_off_by_default() {
         assert_eq!(Config::default().server.cors_allow_origin, None);
+    }
+
+    #[test]
+    fn rejects_a_cors_origin_that_is_not_a_valid_header_value() {
+        // A non-ASCII origin would make the per-request header build fail; caught
+        // on load it is a clear ConfigError instead of a panic under panic=abort.
+        for bad in ["http://exämple.com", "has space", "with\nnewline", ""] {
+            let cfg = Config {
+                server: Server {
+                    cors_allow_origin: Some(bad.into()),
+                    ..Server::default()
+                },
+                ..Config::default()
+            };
+            assert!(
+                matches!(cfg.finalize(), Err(ConfigError::Invalid(_))),
+                "cors_allow_origin {bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_a_valid_cors_origin() {
+        for ok in ["*", "https://flights.example", "http://127.0.0.1:5173"] {
+            let cfg = Config {
+                server: Server {
+                    cors_allow_origin: Some(ok.into()),
+                    ..Server::default()
+                },
+                ..Config::default()
+            };
+            assert!(
+                cfg.finalize().is_ok(),
+                "cors_allow_origin {ok:?} should be accepted"
+            );
+        }
     }
 
     #[test]

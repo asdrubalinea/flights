@@ -255,8 +255,10 @@ mod tests {
         let resp = picture(&t);
         assert_eq!(resp.tracks.first().unwrap().hex, "recede");
         assert_eq!(resp.pacing_hex.as_deref(), Some("inbound"));
-        // The long-tail details never inline into /picture.
-        assert!(resp.tracks.iter().all(|_f| true)); // shape: api::Flight has no `details`
+        // Both flights are carried. That the long-tail `details` never inline into
+        // /picture is enforced by the type (`api::Flight` has no such field), not
+        // assertable at runtime.
+        assert_eq!(resp.tracks.len(), 2);
     }
 
     #[test]
