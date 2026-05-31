@@ -5,9 +5,9 @@ location using a pluggable **Source** (initially the free, community-run
 airplanes.live ADS-B API), deciding *itself* how often to poll so it stays within
 each Source's limits. It crunches the data once and exposes the result over a
 small, cheap local REST API consumed by thin **Clients**: a radar-style TUI (a
-Home-centered scope of gliding blips beside a list of those flights), a waybar
-status-bar module showing just the nearest flight, and a webclient later. Each
-Client only renders what the Server computes — none of them touch a Source.
+Home-centered scope of gliding blips beside a list of those flights), and a
+webclient later. Each Client only renders what the Server computes — none of them
+touch a Source.
 
 ## Language
 
@@ -19,8 +19,8 @@ the only thing that talks to a Source and the sole source of truth.
 _Avoid_: "backend", "daemon" as domain terms (just "the Server").
 
 **Client**:
-Any consumer of the Server's API that only *renders* — the TUI, the waybar module,
-the future webclient. A Client chooses *what* to show and *how often* to ask, but
+Any consumer of the Server's API that only *renders* — the TUI and the future
+webclient. A Client chooses *what* to show and *how often* to ask, but
 never computes which flight is nearest or where a blip belongs; that is always the
 Server's answer. Whether a flight is close enough to be worth showing is Client
 policy, distinct from **Relevance distance** (which gates the Server's pacing,
@@ -79,20 +79,69 @@ Estimating a flight's present position *between* polls by extrapolating its last
 reported position along its last reported velocity, so the display stays current
 without spending an API call. Polling exists to correct the drift this
 accumulates and to discover new flights — not to refresh the screen.
+_Only flights **in contact** are dead-reckoned._ A flight we have **lost
+contact** with is *frozen* at its last-known position, never extrapolated: there
+is no poll coming to correct it, so gliding it onward would be fiction (a plane
+that has quietly landed must not keep sliding across the scope). Within the Search
+area flights are close and slow on screen, so a frozen last-known position barely
+diverges from reality — stale is cheap; fiction is not.
 
 **Snapshot**:
-The complete set of flights in the Search area returned by a single poll,
-authoritative as of its timestamp. A new Snapshot replaces the previous one
-wholesale — flights it omits have left the box. Between Snapshots the app
-dead-reckons the latest one; if polls stop arriving, the current Snapshot is held
-and flagged stale, and individual flights are dropped once they age past a
-staleness cap so the radar never shows fiction indefinitely.
+The set of airborne flights in the Search area returned by a *single* poll,
+authoritative as of its timestamp. A Snapshot is **merged** into the retained set
+of tracked flights — it is not swapped in wholesale. A flight the poll reports
+refreshes its track and is **in contact**; a flight the poll *omits* is **not**
+assumed gone — it has merely not been heard this poll, so its track is kept and
+becomes **lost** (see below). This deliberately reverses the older
+"omitted ⇒ left the area" rule, which turned ordinary feed jitter — flights
+dropping in and out of consecutive polls — into flicker.
+_Avoid_: treating a Snapshot as the whole held state; it is one poll's
+contribution to it. The complete held view at an instant is the **Picture**.
+
+**Contact** / **In contact** / **Lost contact**:
+A track's **contact state**. A flight is **in contact** when the latest poll
+reported it. When a poll that *succeeded* (returned others) omits a flight we
+already track, we have **lost contact**: the track is retained, *frozen* at its
+last-known position (never dead-reckoned — see **Dead reckoning**), visibly marked,
+and kept until it ages past the **staleness cap**, after which it is finally
+dropped. The cap is uniform across the reasons below. A flight is marked lost the
+moment a successful poll omits it (no tolerance delay); a Client softens that
+into a graceful fade by leaning on each track's *age*, so a one-poll coverage blip
+doesn't flash an alarm.
+
+Losing contact is a *per-flight* fact, distinct from the whole-**Picture** going
+*stale*. A single flight can be lost while polls keep arriving for everything else.
+And the converse: a *total* poll outage (every poll failing) does **not** mark
+flights lost — no successful poll is omitting them — so they keep being
+dead-reckoned, gliding on under a stale Picture until the staleness cap clears
+them. (The cap sits a poll-interval above the stale flag, so an outage shows
+last-known motion rather than blanking the moment the Picture goes stale.) Only a
+successful-poll omission freezes a flight.
+
+A lost track carries *why* contact was lost, as far as the data can substantiate:
+- **Landed** — the Source reported this aircraft on the ground. The one
+  disappearance reason we can confirm from real data rather than infer. On-ground
+  aircraft are otherwise not flights at all (the feed is airborne-only); only a hex
+  we were *already* tracking can turn "landed".
+- **Left the Search area** ("left scope") — had the flight held its last course,
+  it would now lie outside the Search **radius**: a near-edge last position with an
+  outbound heading. This hypothetical extrapolation decides the *reason* only; the
+  displayed blip still stays **frozen** at the last-known position, never glided
+  out past the edge. Pure geometry; high confidence.
+- **Lost contact** (plain) — the honest residual: omitted, not on the ground, not
+  outbound. Cause genuinely unknown (a coverage gap, an MLAT dropout, a landing we
+  never got the ground report for); we do not guess at one.
+_Avoid_: inferring "landed" from a low, descending last report — a low flight that
+merely dropped out looks identical, and guessing it would show fiction.
 
 **Track**:
-A single flight as estimated at a particular instant — its **dead-reckoned**
-position plus the geometry derived from it: ground distance and bearing from Home,
-and its **CPA**. A Track is what a Client renders; it is computed *from* the raw
-reported flight inside a **Snapshot**, never the same thing.
+A single flight as estimated at a particular instant — its position plus the
+geometry derived from it: ground distance and bearing from Home, and its **CPA**.
+A Track persists across polls and carries a **contact state** (**in contact**,
+or **lost** with a reason — see **Contact**). An in-contact Track is
+**dead-reckoned** to the query instant; a lost Track is *frozen* at its last-known
+position. A Track is what a Client renders; it is computed *from* the raw reported
+flight a **Snapshot** last carried, never the same thing.
 _Note_: "track" is overloaded, as it is in real ATC usage — a *Track* (this term,
 a tracked target) versus *track* the ground heading in degrees (a flight's
 direction of travel). Both senses are kept; context disambiguates.
@@ -201,15 +250,47 @@ adapter — by design they exist only as opaque strings in a detail group (ADR-0
 > poller, tracker, and radar don't notice; you point config at it, and it declares
 > a faster minimum poll interval because there's no rate limit to respect.
 >
-> **Dev:** When the waybar module asks for the nearest flight, does that trigger a
+> **Dev:** When a Client asks for the nearest flight, does that trigger a
 > Source poll?
 > **Domain expert:** No. The Server polls on its own cadence and holds the latest
 > Snapshot; a Client request just dead-reckons that Snapshot to *now* and answers.
 > Clients are cheap to serve precisely because asking the Server costs no API call —
 > the only thing that ever touches a Source is the Server's own poller.
 >
-> **Dev:** So if the TUI and the waybar module are both open, are we polling
+> **Dev:** So if two Clients are open at once, are we polling
 > airplanes.live twice?
-> **Domain expert:** No — there's one Server and one poller. Both Clients read the
+> **Domain expert:** No — there's one Server and one poller. Every Client reads the
 > same Picture. That's the whole reason the engine lives only in the Server: two
 > processes polling a 1-req/s Source would blow the budget.
+>
+> **Dev:** A flight is on the scope, then the next poll just… doesn't include it.
+> Gone?
+> **Domain expert:** No — that's exactly what we refuse to do now. A poll omitting
+> a flight means we've *lost contact*, not that it vanished. We keep the track,
+> freeze it where we last saw it, mark it lost, and hold it until it ages past the
+> staleness cap. ADS-B jitter drops aircraft in and out constantly; losing the blip
+> every time would be flicker.
+>
+> **Dev:** Frozen — so we stop sliding it along its heading?
+> **Domain expert:** Right. We dead-reckon a flight only while we're hearing it,
+> because the next poll corrects the drift. For a lost flight no correction is
+> coming, so gliding it on would be fiction — and if it had quietly landed we'd be
+> sailing a parked plane across the map. It sits at its last-known spot, stale.
+>
+> **Dev:** How do we ever know it actually landed versus just dropped out?
+> **Domain expert:** Only if the feed tells us the aircraft is on the ground — that
+> we trust. Otherwise we don't guess: a low flight that merely lost coverage looks
+> identical, so it stays plain "lost contact." The one inference we *do* make is
+> "left the Search area" — if its last heading would carry it outside the radius,
+> that's geometry, not a guess.
+>
+> **Dev:** If I had its detail popup open when it dropped out, do I lose everything?
+> **Domain expert:** No. The last-known detail stays — every field, every group —
+> marked stale, for as long as the track lives. You only get the "gone" notice once
+> it ages out for good.
+>
+> **Dev:** A jet we lost was the nearest, and it was inbound. Does it still set our
+> poll rate?
+> **Domain expert:** It can still be shown as the Nearest — badged lost — because
+> it's still the closest thing we know of. But it never *paces*: we won't burn API
+> calls chasing a frozen, stale CPA. Only flights we're actually hearing pace us.

@@ -1,16 +1,21 @@
-//! Holds the latest [`Snapshot`] and answers the three questions the rest of the
-//! app asks of it, all at a caller-supplied instant via **dead reckoning**:
+//! Holds a **retained set of tracks keyed by hex** and answers the questions the
+//! rest of the app asks of it, all at a caller-supplied instant:
 //!
 //! - **Nearest flight** — smallest ground distance from Home (what the display shows).
-//! - **Pacing flight** — soonest CPA among approaching, relevant flights (what
-//!   decides the next poll). Often a *different* aircraft from the nearest.
+//! - **Pacing flight** — soonest CPA among approaching, relevant, *in-contact*
+//!   flights (what decides the next poll). Often a *different* aircraft from the nearest.
 //! - **Staleness** — whether polls have stopped, and which blips have aged out.
 //!
-//! Between Snapshots the tracker never invents a poll: it extrapolates each
-//! flight's last reported position along its last reported velocity. A flight
-//! whose effective age exceeds the staleness cap is dropped so the radar never
-//! shows fiction indefinitely.
+//! A [`Snapshot`] is **merged** into the retained set rather than swapped in
+//! wholesale (ADR-0007). A flight a poll reports is **in contact** and gets
+//! dead-reckoned to the query instant; a flight a *successful* poll omits is
+//! **lost** — kept, **frozen** at its last-known position, and held until it ages
+//! past the staleness cap. Lost contact carries a reason (see [`LostReason`]).
+//! Dead reckoning is therefore **contact-gated**: only in-contact tracks are
+//! extrapolated, and each from its *own* last-seen instant — for a lost flight no
+//! correcting poll is coming, so gliding it on would be fiction.
 
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::domain::{Flight, LatLon, SearchArea, Snapshot};
@@ -30,13 +35,49 @@ pub struct TrackerConfig {
     pub max_flight_age: Duration,
 }
 
+/// Why a tracked flight is **lost** — resolved when a successful poll first omits
+/// it, then held for the life of the track (see CONTEXT.md "Contact"). The reasons
+/// share one staleness cap; they differ only in how much the data substantiates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LostReason {
+    /// The Source reported this aircraft on the ground — the one disappearance we
+    /// confirm from real data rather than infer.
+    Landed,
+    /// Its last course would now carry it outside the Search radius (pure geometry,
+    /// high confidence). The blip still stays *frozen* at the last-known position;
+    /// the extrapolation decides only the reason.
+    LeftScope,
+    /// Omitted, not on the ground, not outbound — cause genuinely unknown. We don't
+    /// guess (a coverage gap, an MLAT dropout, a landing we never got a report for).
+    LostContact,
+}
+
+/// A track's **contact state** (ADR-0007). Decides whether the Track is
+/// dead-reckoned (in contact) or *frozen* (lost), and whether it may **pace**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContactState {
+    /// The latest poll reported this flight.
+    InContact,
+    /// A successful poll omitted it; kept, frozen, and badged with the reason.
+    Lost(LostReason),
+}
+
+impl ContactState {
+    /// Whether the latest poll reported this flight (eligible to be dead-reckoned
+    /// and to pace). A lost flight is neither.
+    pub fn is_in_contact(self) -> bool {
+        matches!(self, ContactState::InContact)
+    }
+}
+
 /// A flight as estimated at a particular instant, with the geometry derived from
 /// that estimate. This is what the UI and poller consume — never the raw wire data.
 #[derive(Debug, Clone)]
 pub struct Track {
     /// The underlying reported flight (identity, altitude, raw velocity).
     pub flight: Flight,
-    /// Dead-reckoned position at the query instant.
+    /// Position at the query instant: **dead-reckoned** while in contact, **frozen**
+    /// at the last-known reported position while lost.
     pub estimated: LatLon,
     /// Ground distance from Home to the estimated position, nautical miles.
     pub distance_nm: f64,
@@ -44,18 +85,25 @@ pub struct Track {
     /// (where to place the blip on a north-up radar).
     pub bearing_from_home: f64,
     /// Closest point of approach from the estimated position; `None` when the
-    /// flight is not usably moving (it neither dead-reckons nor paces).
+    /// flight is not usably moving. For a lost flight this is a *stale* CPA from the
+    /// frozen position — carried for display, but a lost flight never paces.
     pub cpa: Option<Cpa>,
     /// Effective age of the underlying report at the query instant
-    /// (`reported_age` + time since the Snapshot). Drives the staleness cap and
-    /// can fade a blip in the UI.
+    /// (`reported_age` + time since this track was last seen). For a lost flight
+    /// this is time-since-contact; it drives the staleness cap and the UI fade.
     pub age: Duration,
+    /// Contact state at the query instant (see [`ContactState`]).
+    pub contact: ContactState,
 }
 
 impl Track {
-    /// An approaching flight whose CPA distance is within the Relevance distance —
-    /// i.e. one eligible to set the poll cadence.
+    /// An *in-contact*, approaching flight whose CPA distance is within the Relevance
+    /// distance — i.e. one eligible to set the poll cadence. A lost flight never
+    /// paces: we won't spend API calls chasing a frozen, stale CPA.
     fn is_relevant(&self, relevance_distance_nm: f64) -> bool {
+        if !self.contact.is_in_contact() {
+            return false;
+        }
         match self.cpa {
             Some(c) => c.is_approaching() && c.cpa_distance_nm <= relevance_distance_nm,
             None => false,
@@ -120,10 +168,28 @@ fn pacing_index(tracks: &[Track], relevance_distance_nm: f64) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+/// One flight retained across polls: the last raw [`Flight`] a poll carried, when
+/// that poll was taken, and the current contact state. The Tracker holds a map of
+/// these keyed by hex and **merges** each Snapshot into it (ADR-0007).
+#[derive(Debug, Clone)]
+struct RetainedTrack {
+    /// The last reported flight (identity, raw velocity, `reported_age`, details).
+    /// Its `position` is the **last-known** position a lost track freezes at.
+    flight: Flight,
+    /// The instant of the poll that last *reported* this flight. Stays fixed once
+    /// lost, so the track ages out measured from its last real contact.
+    last_seen: Instant,
+    contact: ContactState,
+}
+
 pub struct Tracker {
     area: SearchArea,
     cfg: TrackerConfig,
-    snapshot: Option<Snapshot>,
+    /// Retained tracks keyed by hex — the held state a Snapshot is merged into.
+    tracks: HashMap<String, RetainedTrack>,
+    /// Instant of the most recent *successful* poll — drives snapshot age and
+    /// whole-Picture health, independent of any per-flight lost contact.
+    last_poll_at: Option<Instant>,
     last_error: Option<String>,
 }
 
@@ -132,28 +198,91 @@ impl Tracker {
         Self {
             area,
             cfg,
-            snapshot: None,
+            tracks: HashMap::new(),
+            last_poll_at: None,
             last_error: None,
         }
     }
 
-    /// Replace the held Snapshot wholesale and clear the last error.
+    /// **Merge** a Snapshot into the retained tracks (ADR-0007), not swap it in:
+    ///
+    /// 1. Each airborne flight refreshes its track and is marked **in contact**.
+    /// 2. Each on-ground hex we *already* track turns **landed** (untracked ones are
+    ///    ignored — no new ground blips).
+    /// 3. Any remaining track this *successful* poll omitted has **lost contact**;
+    ///    a newly-lost track gets a reason now, while one already lost keeps its
+    ///    reason and last-seen instant so it ages out from its last real contact.
+    /// 4. Tracks already past the staleness cap are dropped to bound memory.
+    ///
+    /// Only a successful poll calls this, so omission means "heard others, not this
+    /// one" — never a total outage (which leaves every track in contact and
+    /// dead-reckoned under a stale Picture; see [`Tracker::note_error`]).
     pub fn ingest(&mut self, snapshot: Snapshot) {
-        self.snapshot = Some(snapshot);
+        let now = snapshot.taken_at;
+        self.last_poll_at = Some(now);
         self.last_error = None;
+
+        let mut reported: HashSet<String> =
+            HashSet::with_capacity(snapshot.flights.len() + snapshot.on_ground.len());
+
+        // 1. Airborne reports → in contact (refresh or insert).
+        for flight in snapshot.flights {
+            reported.insert(flight.hex.clone());
+            let hex = flight.hex.clone();
+            self.tracks.insert(
+                hex,
+                RetainedTrack {
+                    flight,
+                    last_seen: now,
+                    contact: ContactState::InContact,
+                },
+            );
+        }
+
+        // 2. On-ground reports → landed, but only for a hex we already track and
+        //    did not just hear airborne. last_seen is left untouched (a ground
+        //    report is not a fresh airborne contact), so a landed flight still ages
+        //    out instead of lingering forever at a gate.
+        for hex in &snapshot.on_ground {
+            if reported.contains(hex) {
+                continue;
+            }
+            if let Some(rt) = self.tracks.get_mut(hex) {
+                reported.insert(hex.clone());
+                rt.contact = ContactState::Lost(LostReason::Landed);
+            }
+        }
+
+        // 3. Tracks this poll omitted → lost. Resolve a reason only on the
+        //    in-contact → lost transition; an already-lost track is left as is.
+        let area = self.area;
+        for rt in self.tracks.values_mut() {
+            if reported.contains(&rt.flight.hex) {
+                continue;
+            }
+            if rt.contact.is_in_contact() {
+                rt.contact = ContactState::Lost(loss_reason(rt, now, area));
+            }
+        }
+
+        // 4. Bound memory: forget tracks already past the cap (also enforced per
+        //    query in `resolve`, since more time passes between polls).
+        let cap = self.cfg.max_flight_age;
+        self.tracks.retain(|_, rt| effective_age(rt, now) <= cap);
     }
 
-    /// Record a poll failure. The held Snapshot is retained and dead-reckoned;
-    /// the error surfaces in [`Tracker::health`] once the picture goes stale.
+    /// Record a poll failure. The retained tracks stay **in contact** and keep being
+    /// dead-reckoned (no successful poll omitted them); the error surfaces in
+    /// [`Tracker::health`] once the whole Picture goes stale.
     pub fn note_error(&mut self, message: impl Into<String>) {
         self.last_error = Some(message.into());
     }
 
-    /// Age of the held Snapshot at `now`, or `None` if none has arrived.
+    /// Age of the most recent successful poll at `now`, or `None` if none has
+    /// arrived. This is whole-Picture freshness, distinct from any flight's age.
     pub fn snapshot_age(&self, now: Instant) -> Option<Duration> {
-        self.snapshot
-            .as_ref()
-            .map(|s| now.saturating_duration_since(s.taken_at))
+        self.last_poll_at
+            .map(|t| now.saturating_duration_since(t))
     }
 
     pub fn health(&self, now: Instant) -> Health {
@@ -168,19 +297,15 @@ impl Tracker {
         }
     }
 
-    /// Every flight dead-reckoned to `now`, with derived geometry, dropping those
-    /// aged past the staleness cap. Sorted by ground distance from Home ascending
-    /// (so the **Nearest flight** is first).
+    /// Every retained track resolved to `now` — in-contact ones dead-reckoned, lost
+    /// ones frozen — dropping those aged past the staleness cap. Sorted by ground
+    /// distance from Home ascending (so the **Nearest flight** is first; it may be
+    /// a lost track).
     pub fn tracks_at(&self, now: Instant) -> Vec<Track> {
-        let Some(snapshot) = &self.snapshot else {
-            return Vec::new();
-        };
-        let elapsed = now.saturating_duration_since(snapshot.taken_at);
-
-        let mut tracks: Vec<Track> = snapshot
-            .flights
-            .iter()
-            .filter_map(|f| self.dead_reckon(f, elapsed))
+        let mut tracks: Vec<Track> = self
+            .tracks
+            .values()
+            .filter_map(|rt| self.resolve(rt, now))
             .collect();
         tracks.sort_by(|a, b| a.distance_nm.total_cmp(&b.distance_nm));
         tracks
@@ -218,37 +343,79 @@ impl Tracker {
         }
     }
 
-    /// Dead-reckon one flight forward by `elapsed` (time since the Snapshot),
-    /// returning `None` if its effective age exceeds the staleness cap.
-    fn dead_reckon(&self, flight: &Flight, elapsed: Duration) -> Option<Track> {
-        let age = flight.reported_age + elapsed;
+    /// Resolve one retained track to `now`, or `None` if it has aged past the cap.
+    /// **In contact** → dead-reckoned along its last velocity from its own last-seen
+    /// instant; **lost** → *frozen* at its last-known reported position, never
+    /// extrapolated (CONTEXT.md "Dead reckoning"). Either way the CPA is computed
+    /// from the resolved position; pacing later ignores the lost ones.
+    fn resolve(&self, rt: &RetainedTrack, now: Instant) -> Option<Track> {
+        let age = effective_age(rt, now);
         if age > self.cfg.max_flight_age {
             return None;
         }
 
-        let estimated = match flight.velocity() {
-            Some((track, gs)) => {
-                let nm = gs * age.as_secs_f64() / 3600.0;
-                geo::project(flight.position, track, nm)
-            }
-            // Unknown / negligible velocity: hold the last reported position.
-            None => flight.position,
+        let estimated = match rt.contact {
+            ContactState::InContact => match rt.flight.velocity() {
+                Some((track, gs)) => {
+                    let nm = gs * age.as_secs_f64() / 3600.0;
+                    geo::project(rt.flight.position, track, nm)
+                }
+                // Unknown / negligible velocity: hold the last reported position.
+                None => rt.flight.position,
+            },
+            // Lost: frozen at the last-known position — no correcting poll is
+            // coming, so gliding it on would be fiction.
+            ContactState::Lost(_) => rt.flight.position,
         };
 
         let distance_nm = geo::haversine_nm(self.area.center, estimated);
         let bearing_from_home = geo::bearing_deg(self.area.center, estimated);
-        let cpa = flight
+        let cpa = rt
+            .flight
             .velocity()
             .map(|(track, gs)| geo::cpa(self.area.center, estimated, track, gs));
 
         Some(Track {
-            flight: flight.clone(),
+            flight: rt.flight.clone(),
             estimated,
             distance_nm,
             bearing_from_home,
             cpa,
             age,
+            contact: rt.contact,
         })
+    }
+}
+
+/// Effective age of a track's underlying position report at `now`: how old it was
+/// when last reported, plus time since that poll. It grows for a lost (frozen)
+/// track and for any track under a total poll outage — driving the staleness cap
+/// and the Client's fade. (For a lost track this is "time since contact" plus the
+/// initial report age.)
+fn effective_age(rt: &RetainedTrack, now: Instant) -> Duration {
+    rt.flight.reported_age + now.saturating_duration_since(rt.last_seen)
+}
+
+/// The reason a just-omitted track lost contact (landing is resolved separately,
+/// from a real on-ground report). **Left scope** when dead-reckoning its last course
+/// to this poll would place it outside the Search radius — a near-edge last position
+/// with an outbound heading, pure geometry; otherwise plain **lost contact**, the
+/// honest residual we don't guess a cause for. This hypothetical extrapolation
+/// decides only the reason; the displayed blip still freezes at the last-known
+/// position (see [`Tracker::resolve`]).
+fn loss_reason(rt: &RetainedTrack, now: Instant, area: SearchArea) -> LostReason {
+    match rt.flight.velocity() {
+        Some((track, gs)) => {
+            let nm = gs * effective_age(rt, now).as_secs_f64() / 3600.0;
+            let hypothetical = geo::project(rt.flight.position, track, nm);
+            if geo::haversine_nm(area.center, hypothetical) > area.radius_nm {
+                LostReason::LeftScope
+            } else {
+                LostReason::LostContact
+            }
+        }
+        // Not usably moving: it cannot be heading out of scope.
+        None => LostReason::LostContact,
     }
 }
 
@@ -424,5 +591,205 @@ mod tests {
             tr.health(t0 + Duration::from_secs(200)),
             Health::Stale { .. }
         ));
+    }
+
+    // --- Retained tracks & contact state (ADR-0007) -----------------------------
+
+    #[test]
+    fn an_omitted_flight_is_retained_as_lost_not_dropped() {
+        let t0 = Instant::now();
+        let mut tr = Tracker::new(area(), cfg());
+        let a = flight("a", LatLon::new(0.1, 0.0)); // 6 nm north
+        let b = flight("b", LatLon::new(0.2, 0.0)); // 12 nm north
+        tr.ingest(Snapshot::new(vec![a, b], t0));
+
+        // The next (successful) poll omits b — it is kept, not assumed gone.
+        let t1 = t0 + Duration::from_secs(30);
+        tr.ingest(Snapshot::new(vec![flight("a", LatLon::new(0.1, 0.0))], t1));
+
+        let tracks = tr.tracks_at(t1);
+        assert_eq!(tracks.len(), 2, "the omitted flight must be retained");
+        let by = |hex| tracks.iter().find(|t| t.flight.hex == hex).unwrap();
+        assert_eq!(by("a").contact, ContactState::InContact);
+        // b is stationary and well inside the radius: not landed, not outbound.
+        assert_eq!(by("b").contact, ContactState::Lost(LostReason::LostContact));
+    }
+
+    #[test]
+    fn a_lost_flight_is_frozen_never_dead_reckoned() {
+        let t0 = Instant::now();
+        let mut tr = Tracker::new(area(), cfg());
+        // At Home, flying east at 360 kt — would clearly drift if dead-reckoned.
+        tr.ingest(Snapshot::new(
+            vec![moving("a", LatLon::new(0.0, 0.0), 90.0, 360.0)],
+            t0,
+        ));
+        // A later poll omits it (and reports someone else, so the poll succeeded).
+        let t1 = t0 + Duration::from_secs(10);
+        tr.ingest(Snapshot::new(vec![flight("other", LatLon::new(0.5, 0.0))], t1));
+
+        // A full minute on, an in-contact flight would have moved 6 nm; this one,
+        // frozen at its last-known position (Home), has not budged.
+        let a = tr
+            .tracks_at(t1 + Duration::from_secs(60))
+            .into_iter()
+            .find(|t| t.flight.hex == "a")
+            .unwrap();
+        assert!(matches!(a.contact, ContactState::Lost(_)));
+        assert!(
+            a.distance_nm < 0.1,
+            "a frozen flight drifted to {} nm",
+            a.distance_nm
+        );
+    }
+
+    #[test]
+    fn an_on_ground_report_lands_a_tracked_flight_only() {
+        let t0 = Instant::now();
+        let mut tr = Tracker::new(area(), cfg());
+        tr.ingest(Snapshot::new(vec![flight("a", LatLon::new(0.1, 0.0))], t0));
+
+        // Next poll: "a" is reported on the ground; "ghost" we never tracked is too.
+        let t1 = t0 + Duration::from_secs(20);
+        tr.ingest(Snapshot::with_ground(
+            vec![flight("other", LatLon::new(0.3, 0.0))],
+            vec!["a".to_string(), "ghost".to_string()],
+            t1,
+        ));
+
+        let tracks = tr.tracks_at(t1);
+        let a = tracks.iter().find(|t| t.flight.hex == "a").unwrap();
+        assert_eq!(a.contact, ContactState::Lost(LostReason::Landed));
+        // The untracked ground hex never becomes a blip (airborne-only at the seam).
+        assert!(tracks.iter().all(|t| t.flight.hex != "ghost"));
+    }
+
+    #[test]
+    fn an_outbound_edge_flight_is_lost_to_left_scope_but_still_frozen_inside() {
+        let t0 = Instant::now();
+        let mut tr = Tracker::new(area(), cfg());
+        // 95 nm north (radius is 100), flying due north at 600 kt.
+        let edge = moving("edge", LatLon::new(95.0 / 60.0, 0.0), 0.0, 600.0);
+        tr.ingest(Snapshot::new(vec![edge], t0));
+
+        // A poll 60 s later omits it. Held course → 95 + 600·(60/3600) = 105 nm,
+        // past the radius ⇒ left scope.
+        let t1 = t0 + Duration::from_secs(60);
+        tr.ingest(Snapshot::new(vec![flight("anchor", LatLon::new(0.0, 0.0))], t1));
+
+        let e = tr
+            .tracks_at(t1)
+            .into_iter()
+            .find(|t| t.flight.hex == "edge")
+            .unwrap();
+        assert_eq!(e.contact, ContactState::Lost(LostReason::LeftScope));
+        // The reason used the hypothetical extrapolation, but the *displayed* blip
+        // stays frozen at the last-known 95 nm — never glided out past the edge.
+        assert!(
+            (e.distance_nm - 95.0).abs() < 0.5,
+            "frozen blip should stay at the last-known 95 nm, was {} nm",
+            e.distance_nm
+        );
+    }
+
+    #[test]
+    fn a_one_poll_dropout_returns_to_in_contact() {
+        let t0 = Instant::now();
+        let mut tr = Tracker::new(area(), cfg());
+        let moving_a = || moving("a", LatLon::new(0.1, 0.0), 90.0, 360.0);
+        tr.ingest(Snapshot::new(vec![moving_a()], t0));
+
+        // Dropped for one poll → lost.
+        let t1 = t0 + Duration::from_secs(10);
+        tr.ingest(Snapshot::new(vec![flight("b", LatLon::new(0.5, 0.0))], t1));
+        assert!(matches!(
+            tr.tracks_at(t1)
+                .into_iter()
+                .find(|t| t.flight.hex == "a")
+                .unwrap()
+                .contact,
+            ContactState::Lost(_)
+        ));
+
+        // Reappears next poll → back in contact (this is the jitter we refuse to
+        // turn into flicker).
+        let t2 = t1 + Duration::from_secs(10);
+        tr.ingest(Snapshot::new(vec![moving_a()], t2));
+        let a = tr
+            .tracks_at(t2)
+            .into_iter()
+            .find(|t| t.flight.hex == "a")
+            .unwrap();
+        assert_eq!(a.contact, ContactState::InContact);
+    }
+
+    #[test]
+    fn a_lost_flight_can_be_nearest_but_never_paces() {
+        let t0 = Instant::now();
+        let mut tr = Tracker::new(area(), cfg());
+        // Two inbounds on the Home meridian (both pass ~overhead → relevant).
+        // The closer/faster one paces; the farther/slower one is the fallback.
+        let inbound = moving("inbound", LatLon::new(-20.0 / 60.0, 0.0), 0.0, 480.0);
+        let inbound2 = moving("inbound2", LatLon::new(-40.0 / 60.0, 0.0), 0.0, 300.0);
+        tr.ingest(Snapshot::new(vec![inbound, inbound2], t0));
+        assert_eq!(tr.nearest_at(t0).unwrap().flight.hex, "inbound");
+        assert_eq!(tr.pacing_at(t0).unwrap().flight.hex, "inbound");
+
+        // Next poll omits the pacing flight; the other stays in contact.
+        let t1 = t0 + Duration::from_secs(5);
+        tr.ingest(Snapshot::new(
+            vec![moving("inbound2", LatLon::new(-38.0 / 60.0, 0.0), 0.0, 300.0)],
+            t1,
+        ));
+
+        // It is still the Nearest (closest thing we know of), now lost...
+        let near = tr.nearest_at(t1).unwrap();
+        assert_eq!(near.flight.hex, "inbound");
+        assert!(matches!(near.contact, ContactState::Lost(_)));
+        // ...but pacing has moved to the still-in-contact flight: we won't chase a
+        // frozen, stale CPA.
+        assert_eq!(tr.pacing_at(t1).unwrap().flight.hex, "inbound2");
+    }
+
+    #[test]
+    fn a_total_outage_keeps_dead_reckoning_under_a_stale_picture() {
+        // Stale flag trips at 30 s; tracks survive to 120 s — so there is a window
+        // where the Picture is stale yet flights still glide (the case this guards).
+        // Production keeps the same shape: the stale flag at 2 × max_poll, the drop
+        // cap one poll-interval higher at 3 × max_poll (see `tracker_cfg`). The exact
+        // numbers here just widen the window so both states are observable at once.
+        let cfg = TrackerConfig {
+            relevance_distance_nm: 30.0,
+            stale_after: Duration::from_secs(30),
+            max_flight_age: Duration::from_secs(120),
+        };
+        let t0 = Instant::now();
+        let mut tr = Tracker::new(area(), cfg);
+        tr.ingest(Snapshot::new(
+            vec![moving("a", LatLon::new(0.0, 0.0), 90.0, 360.0)],
+            t0,
+        ));
+
+        // Every poll now fails: no ingest, only errors. No *successful* poll omits
+        // the flight, so it stays in contact and keeps gliding — unlike a per-flight
+        // lost contact.
+        tr.note_error("network down");
+        let later = t0 + Duration::from_secs(60); // 360 kt · 60 s = 6 nm east
+        let a = tr
+            .tracks_at(later)
+            .into_iter()
+            .find(|t| t.flight.hex == "a")
+            .unwrap();
+        assert_eq!(a.contact, ContactState::InContact);
+        assert!(
+            (a.distance_nm - 6.0).abs() < 0.1,
+            "a flight under a total outage should keep dead-reckoning, was {} nm",
+            a.distance_nm
+        );
+        // The whole Picture is stale, but the flight is not marked lost and survives.
+        assert!(matches!(tr.health(later), Health::Stale { .. }));
+
+        // Past the cap it is finally dropped, exactly as before.
+        assert!(tr.tracks_at(t0 + Duration::from_secs(200)).is_empty());
     }
 }

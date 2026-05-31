@@ -13,7 +13,7 @@ use ratatui::widgets::canvas::{Canvas, Circle, Line as CanvasLine, Points};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use flights_api::{Cpa, DetailGroup, Flight, FlightDetail, VerticalTrend};
+use flights_api::{ContactState, Cpa, DetailGroup, Flight, FlightDetail, VerticalTrend};
 
 use super::app::{App, Conn, DetailView, Mode};
 
@@ -71,7 +71,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // The flight-detail popup layers over the dimmed radar+list.
     if app.mode == Mode::Detail {
         let detail = app.detail.clone();
-        draw_detail(frame, detail.as_ref(), &mut app.detail_scroll);
+        // The popup body is a possibly-older /flight fetch; the stale banner is
+        // derived from the *live* picture so a flight that goes lost while open is
+        // marked at once, without a re-fetch (ADR-0007: last-known detail survives).
+        let banner = app
+            .selected_hex
+            .as_deref()
+            .and_then(|hex| tracks.iter().find(|f| f.hex == hex))
+            .and_then(lost_banner);
+        draw_detail(frame, detail.as_ref(), banner, &mut app.detail_scroll);
     }
 }
 
@@ -170,10 +178,17 @@ fn draw_radar(
                 }
                 let (x, y) = radar_xy(t);
                 let color = blip_color(t, &nearest_hex, &pacing_hex, &selected_hex);
+                // A lost flight (e.g. a lost Nearest) gets a ✕ so the faded blip
+                // reads as lost rather than merely anonymous.
+                let text = if is_lost(t) {
+                    format!("{} ✕", label(t))
+                } else {
+                    label(t)
+                };
                 ctx.print(
                     x + radius * 0.03,
                     y,
-                    Line::from(Span::styled(label(t), Style::new().fg(color))),
+                    Line::from(Span::styled(text, Style::new().fg(color))),
                 );
             }
         });
@@ -211,7 +226,8 @@ fn list_row(t: &Flight, pacing_hex: Option<&str>, max_width: u16) -> Line<'stati
         Style::new()
             .fg(Color::LightRed)
             .add_modifier(Modifier::BOLD)
-    } else if t.ident.is_none() {
+    } else if is_lost(t) || t.ident.is_none() {
+        // Lost flights fade like anonymous ones (a lost flight never paces).
         Style::new().fg(Color::DarkGray)
     } else {
         Style::new()
@@ -234,14 +250,19 @@ fn list_row(t: &Flight, pacing_hex: Option<&str>, max_width: u16) -> Line<'stati
         None => Span::raw(String::new()),
     };
 
-    let (arrow, arrow_color, cpa) = match &t.cpa {
-        Some(c) if approaching(c) => (
-            "▲",
-            Color::Green,
-            format!("{:.0}nm/{:.0}s", c.cpa_distance_nm, c.time_to_cpa_s),
-        ),
-        Some(_) => ("▼", Color::Blue, String::new()),
-        None => ("·", Color::DarkGray, String::new()),
+    // A lost flight shows its reason badge here instead of a (stale) CPA — its CPA
+    // is frozen and never paces, so the approach arrow would mislead.
+    let (arrow, arrow_color, cpa) = match lost_badge(t.state) {
+        Some((word, color)) => ("✕", color, word.to_string()),
+        None => match &t.cpa {
+            Some(c) if approaching(c) => (
+                "▲",
+                Color::Green,
+                format!("{:.0}nm/{:.0}s", c.cpa_distance_nm, c.time_to_cpa_s),
+            ),
+            Some(_) => ("▼", Color::Blue, String::new()),
+            None => ("·", Color::DarkGray, String::new()),
+        },
     };
 
     // (priority, group): when the row can't fit, the highest-priority-number
@@ -358,8 +379,13 @@ fn draw_status(
         .unwrap_or_else(|| "—".into());
 
     let find = |hex: Option<&str>| hex.and_then(|h| tracks.iter().find(|t| t.hex == h));
+    // The Nearest flight can be one we've lost contact with (still the closest thing
+    // we know of) — badge it so "nearest" isn't read as "currently tracked".
     let nearest = find(nearest_hex)
-        .map(fmt_position)
+        .map(|f| match lost_badge(f.state) {
+            Some((word, _)) => format!("{}  [lost: {word}]", fmt_position(f)),
+            None => fmt_position(f),
+        })
         .unwrap_or_else(|| "(none)".into());
     let pacing = find(pacing_hex)
         .map(fmt_pacing)
@@ -422,9 +448,16 @@ fn draw_status(
 
 /// The flight-detail popup: dim the frame, clear a centered box, and fill it from
 /// the lazily-fetched [`FlightDetail`] — or a "left the area" / error notice when
-/// the flight has dropped out or the fetch failed (never fabricated values). The
-/// key hints sit on a fixed bottom line so scrolling the body never loses them.
-fn draw_detail(frame: &mut Frame, detail: Option<&DetailView>, scroll: &mut u16) {
+/// the flight has aged out or the fetch failed (never fabricated values). A `banner`
+/// (set when the live picture has the flight as *lost*) is prepended to the loaded
+/// body so the last-known detail reads as stale. The key hints sit on a fixed bottom
+/// line so scrolling the body never loses them.
+fn draw_detail(
+    frame: &mut Frame,
+    detail: Option<&DetailView>,
+    banner: Option<Line<'static>>,
+    scroll: &mut u16,
+) {
     let full = frame.area();
     frame
         .buffer_mut()
@@ -443,10 +476,15 @@ fn draw_detail(frame: &mut Frame, detail: Option<&DetailView>, scroll: &mut u16)
         Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
 
     let (body, footer) = match detail {
-        Some(DetailView::Loaded(detail)) => (
-            detail_lines(detail),
-            "Esc close · ↑/↓ flight · PgUp/PgDn scroll",
-        ),
+        Some(DetailView::Loaded(detail)) => {
+            let mut lines = detail_lines(detail);
+            // Lead with the stale banner when the flight is currently lost.
+            if let Some(b) = banner {
+                lines.insert(0, b);
+                lines.insert(1, Line::from(""));
+            }
+            (lines, "Esc close · ↑/↓ flight · PgUp/PgDn scroll")
+        }
         Some(DetailView::LeftArea) => (
             notice("— flight left the area —"),
             "Esc close · ↑/↓ next flight",
@@ -667,6 +705,41 @@ fn approaching(c: &Cpa) -> bool {
     c.time_to_cpa_s >= 0.0
 }
 
+/// Whether the Server has **lost contact** with this flight (any reason). A lost
+/// flight is frozen at its last-known position and rendered faded, not dropped.
+fn is_lost(f: &Flight) -> bool {
+    f.state != ContactState::InContact
+}
+
+/// A compact badge for a lost flight: a short reason word and a muted colour, or
+/// `None` while in contact. Colours stay subdued so a one-poll dropout fades rather
+/// than flashing an alarm (ADR-0007).
+fn lost_badge(state: ContactState) -> Option<(&'static str, Color)> {
+    match state {
+        ContactState::InContact => None,
+        ContactState::Landed => Some(("landed", Color::DarkGray)),
+        ContactState::LeftScope => Some(("left scope", Color::DarkGray)),
+        // The honest residual — worth a glance, but still muted, not alarming.
+        ContactState::LostContact => Some(("lost", Color::Yellow)),
+    }
+}
+
+/// A one-line stale banner for the detail popup when the selected flight is lost,
+/// reflecting the *live* picture (the popup body is a possibly-older fetch). `None`
+/// while in contact.
+fn lost_banner(f: &Flight) -> Option<Line<'static>> {
+    let (text, color) = match f.state {
+        ContactState::InContact => return None,
+        ContactState::Landed => ("landed — last-known data", Color::DarkGray),
+        ContactState::LeftScope => ("left the Search area — last-known data", Color::DarkGray),
+        ContactState::LostContact => ("contact lost — last-known data", Color::Yellow),
+    };
+    Some(Line::from(Span::styled(
+        format!("⚠ {text}, {:.0}s ago", f.age_s),
+        Style::new().fg(color).add_modifier(Modifier::BOLD),
+    )))
+}
+
 fn fmt_position(f: &Flight) -> String {
     let alt = f
         .altitude_ft
@@ -713,8 +786,10 @@ fn is_flagged(
     hex == *nearest || hex == *pacing || hex == *selected
 }
 
-/// Blip color by priority: selected, then pacing, then nearest, then approach
-/// state. Anonymous (ident-blocked) flights are dimmed unless flagged.
+/// Blip color by priority: selected, then *lost* (faded), then pacing, then
+/// nearest, then approach state. A lost flight fades to grey even when it is the
+/// Nearest — selection still wins, so the user can see what they picked. Anonymous
+/// (ident-blocked) flights are dimmed unless flagged.
 fn blip_color(
     f: &Flight,
     nearest: &Option<String>,
@@ -724,6 +799,9 @@ fn blip_color(
     let hex = f.hex.as_str();
     if selected.as_deref() == Some(hex) {
         return Color::White;
+    }
+    if is_lost(f) {
+        return Color::DarkGray;
     }
     if pacing.as_deref() == Some(hex) {
         return Color::LightRed;
@@ -746,8 +824,8 @@ mod tests {
     use crate::client::Client;
     use crate::ui::app::{App, DetailView, Mode};
     use flights_api::{
-        Cpa, DetailField, DetailGroup, Flight, FlightDetail, Health, LatLon, Meta, PictureResponse,
-        Units, VerticalTrend,
+        ContactState, Cpa, DetailField, DetailGroup, Flight, FlightDetail, Health, LatLon, Meta,
+        PictureResponse, Units, VerticalTrend,
     };
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -785,6 +863,7 @@ mod tests {
             squawk: None,
             emergency: None,
             emitter_category: None,
+            state: ContactState::InContact,
             age_s: 0.0,
             cpa: Some(Cpa {
                 time_to_cpa_s: 120.0,
@@ -895,6 +974,57 @@ mod tests {
         assert!(
             text.contains("flight left the area"),
             "expected the left-the-area notice"
+        );
+    }
+
+    #[test]
+    fn list_row_badges_a_lost_flight_instead_of_a_stale_cpa() {
+        // flight() carries an approaching CPA; once lost, the reason badge replaces
+        // it (a frozen CPA must not read as a live approach).
+        let mut f = flight("lost01", "GHOST", 5.0, 90.0);
+        f.state = ContactState::LeftScope;
+        let line = list_row(&f, None, 60);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("left scope"), "row should badge the reason: {text:?}");
+        assert!(!text.contains("nm/"), "a lost flight shows no live CPA: {text:?}");
+    }
+
+    #[test]
+    fn a_lost_nearest_is_badged_in_the_status_line() {
+        let mut lost = flight("lost01", "GH", 5.0, 90.0);
+        lost.state = ContactState::LeftScope;
+        let mut app = app(vec![lost], None);
+        // A wide terminal so the badge isn't clipped off the status line.
+        let text = render_to_text(&mut app, 200, 40);
+        assert!(
+            text.contains("[lost: left scope]"),
+            "the nearest line should badge a lost flight"
+        );
+    }
+
+    #[test]
+    fn popup_shows_a_stale_banner_for_a_lost_selected_flight() {
+        // The selected flight is lost in the live picture; the popup keeps its
+        // last-known detail but leads with a stale banner (ADR-0007).
+        let mut lost = flight("sel123", "SELFLT", 3.0, 90.0);
+        lost.state = ContactState::LostContact;
+        lost.age_s = 45.0;
+        let mut app = app(vec![lost.clone()], None);
+        app.selected_hex = Some("sel123".into());
+        app.mode = Mode::Detail;
+        app.detail = Some(DetailView::Loaded(Box::new(FlightDetail {
+            flight: lost,
+            details: vec![],
+        })));
+
+        let text = render_to_text(&mut app, 120, 40);
+        assert!(
+            text.contains("contact lost"),
+            "popup should show the stale banner: {text:?}"
+        );
+        assert!(
+            text.contains("SELFLT"),
+            "the last-known detail still shows beneath the banner"
         );
     }
 

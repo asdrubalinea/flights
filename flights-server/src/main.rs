@@ -1,8 +1,8 @@
 //! `flights-server` — the long-running engine and HTTP daemon (ADR-0005). It owns
 //! the Source, polls it on its self-chosen cadence (ADR-0002), holds the latest
 //! Snapshot in a shared [`Tracker`], and answers every airspace question over a
-//! small loopback REST API. Thin Clients (the TUI, the waybar module) only render
-//! what it computes; none of them touch a Source.
+//! small loopback REST API. Thin Clients (the TUI, and a webclient later) only
+//! render what it computes; none of them touch a Source.
 //!
 //! Entry point: load config, read any Source secret from the environment, build
 //! the Source, spawn the poller onto a shared `Arc<RwLock<Tracker>>`, and serve
@@ -147,15 +147,19 @@ fn poll_bounds(cfg: &Config, source: &dyn FlightSource) -> PollBounds {
     }
 }
 
-/// Tracker tunables derived from config: the relevance cutoff, and a staleness
-/// cap of ~2× the max poll interval (both the snapshot-stale flag and the
-/// per-flight drop age).
+/// Tracker tunables derived from config: the relevance cutoff and two staleness
+/// thresholds keyed off the max poll interval. The whole-Picture **stale** flag
+/// trips at `2 × max_poll` (≈ two missed polls); the per-flight **staleness cap**
+/// — the drop age — sits one poll-interval higher at `3 × max_poll`. Keeping the
+/// cap *above* the stale flag is deliberate: under a feed outage the Picture is
+/// marked stale while its last-known flights keep gliding (dead-reckoned) for a
+/// beat before being dropped, rather than blanking the instant the flag trips.
 fn tracker_cfg(cfg: &Config) -> TrackerConfig {
-    let cap = cfg.max_poll() * 2;
+    let max_poll = cfg.max_poll();
     TrackerConfig {
         relevance_distance_nm: cfg.search.relevance_distance_nm,
-        stale_after: cap,
-        max_flight_age: cap,
+        stale_after: max_poll * 2,
+        max_flight_age: max_poll * 3,
     }
 }
 
@@ -249,5 +253,26 @@ fn fmt_pacing(t: &Track) -> String {
             c.time_to_cpa_s
         ),
         None => label(&t.flight),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The drop cap must sit strictly above the stale flag, or a feed outage would
+    /// drop last-known flights at or before the Picture is even flagged stale —
+    /// collapsing the deliberate "stale-but-still-gliding" window (ADR-0007). This
+    /// guards the relationship, not the exact multipliers.
+    #[test]
+    fn drop_cap_sits_above_the_stale_flag() {
+        let cfg = Config::default();
+        let tc = tracker_cfg(&cfg);
+        assert!(
+            tc.max_flight_age > tc.stale_after,
+            "max_flight_age {:?} must exceed stale_after {:?} so flights glide under a stale Picture",
+            tc.max_flight_age,
+            tc.stale_after
+        );
     }
 }

@@ -12,7 +12,7 @@ build order. It does not restate the ADR rationale.
 A long-running **Server** that crunches **Nearest flight** / **Picture** data for a
 fixed **Home** from a pluggable **Source** (first: the free, keyless
 **airplanes.live** ADS-B API) and exposes it over a small loopback REST API,
-consumed by thin Clients: a radar-style TUI, a waybar module, and a webclient later.
+consumed by thin Clients: a radar-style TUI, and a webclient later.
 Blocking I/O, no async runtime — including the HTTP server (sync `tiny_http`,
 ADR-0006). The client/server split rationale is ADR-0005; the hybrid flight-detail
 data model the API carries is ADR-0004.
@@ -89,8 +89,6 @@ flights-tui/             – ratatui radar, thin client            (bin `flights
   client.rs              – ureq GET helpers + flights-api deserialization
   ui/                    – app.rs · render.rs · event.rs   (radar + list + detail
                            popup; remote data, renders DetailGroups verbatim)
-
-waybar/                  – shell one-liner: curl 127.0.0.1:7878/nearest | jq …
 
 scripts/
   flights-radar          – launch Server + radar TUI together (one command); starts
@@ -191,8 +189,6 @@ Deliberately **not** used (intentional, not oversight):
     status (incl. the vertical-trend glyph) from the response, fetch `/flight/{hex}`
     when the detail popup opens, and add a "server unreachable" state beside
     `stale`/`no_data`.
-11. **waybar module**: a shell one-liner over `/nearest`, with a client-side distance
-    threshold for "show only when something is close".
 
 ## Testing
 
@@ -215,5 +211,4 @@ variable** — never committed.
 
 **Client** config: the TUI takes the Server URL and its own render rate (~4 fps) —
 fps is a display concern and no longer lives server-side, since the screen is kept
-current by re-querying the Server (which costs no Source call). The waybar module
-needs only the URL and its own distance threshold.
+current by re-querying the Server (which costs no Source call).

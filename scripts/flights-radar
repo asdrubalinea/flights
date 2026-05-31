@@ -7,8 +7,8 @@
 # (q / Ctrl-C) stops only the Server this script started.
 #
 # It honours the single-poller invariant the whole split exists for: if a Server is
-# already answering (e.g. one you left running for the waybar module), it is REUSED
-# and left running — we never spawn a second poller against a rate-limited Source.
+# already answering (e.g. one you left running), it is REUSED and left running — we
+# never spawn a second poller against a rate-limited Source.
 #
 #   nix run .#radar            # installed: uses the packaged binaries
 #   ./scripts/flights-radar    # dev checkout: cargo-builds, then runs target/debug

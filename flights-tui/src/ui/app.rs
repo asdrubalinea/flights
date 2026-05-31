@@ -31,9 +31,11 @@ pub enum Conn {
     Down(String),
 }
 
-/// What the detail popup currently has for the selected flight: its full detail,
-/// a "left the area" notice once it drops out of the picture or 404s, or an error
-/// if the fetch failed.
+/// What the detail popup currently has for the selected flight: its full (possibly
+/// last-known) detail, a "left the area" notice once the track has **aged out** of
+/// the picture (or `/flight` 404s), or an error if the fetch failed. A flight the
+/// Server has merely *lost contact* with stays `Loaded` — its last-known detail
+/// survives, marked stale by a banner — until it finally ages out (ADR-0007).
 #[derive(Debug, Clone)]
 pub enum DetailView {
     Loaded(Box<FlightDetail>),
@@ -96,9 +98,11 @@ impl App {
     /// Poll `/picture` and fold the result into state. On success the connection
     /// is marked up and the picture replaced; on failure the connection goes down
     /// and the last picture is kept (frozen) so the screen still shows something.
-    /// While the popup is open, a selected flight that has dropped out of the new
-    /// picture flips the popup to "left the area" — using data already in hand,
-    /// no extra fetch.
+    /// While the popup is open, a selected flight that has **aged out** of the new
+    /// picture flips the popup to "left the area" — using data already in hand, no
+    /// extra fetch. A merely *lost* flight is still in the picture, so this fires
+    /// only on its final drop; the stale banner (drawn from the live picture) marks
+    /// it lost in the meantime.
     pub fn refresh(&mut self) {
         match self.client.picture() {
             Ok(picture) => {
@@ -214,7 +218,7 @@ fn next_index(current: Option<usize>, n: usize, forward: bool) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flights_api::{Health, Units, VerticalTrend};
+    use flights_api::{ContactState, Health, Units, VerticalTrend};
 
     fn meta() -> Meta {
         Meta {
@@ -248,6 +252,7 @@ mod tests {
             squawk: None,
             emergency: None,
             emitter_category: None,
+            state: ContactState::InContact,
             age_s: 0.0,
             cpa: None,
         }

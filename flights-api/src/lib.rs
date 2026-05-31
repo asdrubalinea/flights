@@ -1,6 +1,6 @@
 //! The **flights** REST wire format: the single shared contract between the
-//! Server (ADR-0005) and its thin Clients (the TUI, the waybar module, a future
-//! webclient). Nothing here knows about geometry, sources, or the monotonic clock
+//! Server (ADR-0005) and its thin Clients (the TUI and a future webclient).
+//! Nothing here knows about geometry, sources, or the monotonic clock
 //! — it is serde DTOs and unit constants only, so the Server can `Serialize` what
 //! it computes and every Client can `Deserialize` the same shapes in lockstep.
 //!
@@ -53,6 +53,27 @@ pub enum VerticalTrend {
     Unknown,
 }
 
+/// A flight's **contact state**, resolved server-side (ADR-0007): whether the
+/// latest poll reported it, or a *successful* poll omitted it (the three `lost`
+/// reasons). The Server decides; a Client renders — it fades and badges a lost
+/// blip rather than dropping it, leaning on the growing [`Flight::age_s`] so a
+/// one-poll coverage blip doesn't flash an alarm. A lost flight is **frozen** at
+/// its last-known position (never dead-reckoned), can still be the Nearest flight,
+/// but never **paces**; the Server drops it once it ages past the staleness cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContactState {
+    /// The latest poll reported this flight; it is being dead-reckoned.
+    InContact,
+    /// A poll reported this aircraft on the ground — the one disappearance reason
+    /// confirmed from real data rather than inferred.
+    Landed,
+    /// Its last course would now carry it outside the Search radius (pure geometry).
+    LeftScope,
+    /// Omitted by a successful poll, not on the ground, not outbound — cause unknown.
+    LostContact,
+}
+
 /// The flight's **closest point of approach** to Home, as the Server computed it.
 /// A negative `time_to_cpa_s` means the closest pass is already behind it (the
 /// flight is receding).
@@ -63,9 +84,10 @@ pub struct Cpa {
 }
 
 /// One flight as the Server sees it *at the instant of the request* — the typed,
-/// cross-provider fields promoted onto the domain `Flight` (ADR-0004),
-/// dead-reckoned and with geometry already derived. This is what `/picture`'s
-/// `tracks[]` and `/nearest`'s `flight` carry. The opaque long-tail `details`
+/// cross-provider fields promoted onto the domain `Flight` (ADR-0004), with geometry
+/// already derived, and its position **dead-reckoned** while in contact or **frozen**
+/// while lost (see [`ContactState`]). This is what `/picture`'s `tracks[]` and
+/// `/nearest`'s `flight` carry. The opaque long-tail `details`
 /// are **not** here — they would be ~40 strings per flight at the Client's frame
 /// rate; they ride [`FlightDetail`] on `/flight/{hex}` instead.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -109,9 +131,16 @@ pub struct Flight {
     pub emergency: Option<String>,
     /// Decoded coarse aircraft classification (e.g. `"large"`), or `null`.
     pub emitter_category: Option<String>,
-    /// Effective age of the underlying position report at the request instant.
+    /// Contact state (see [`ContactState`]): `in_contact` while the feed reports it,
+    /// else a `lost` reason. A lost flight's position is **frozen**, not dead-reckoned.
+    pub state: ContactState,
+    /// Effective age of the underlying position report at the request instant — for
+    /// a lost flight this is *time since contact*, which keeps growing and drives a
+    /// Client-side fade until the Server drops the track at its staleness cap.
     pub age_s: f64,
     /// Closest point of approach, or `null` when the flight is not usably moving.
+    /// For a lost flight this is a *stale* CPA from the frozen position — shown, but
+    /// it never paces (the Server gates pacing to in-contact flights).
     pub cpa: Option<Cpa>,
 }
 
@@ -135,9 +164,10 @@ pub struct DetailGroup {
 
 /// One flight's **full** detail, served by `/flight/{hex}`: every promoted field
 /// (flattened from [`Flight`], so the JSON is one flat object) plus the opaque,
-/// adapter-formatted [`DetailGroup`]s shown only in the detail popup. Fetched
-/// once when the popup opens; the Server returns the last-known detail while the
-/// flight is still in the area and `404`s once it leaves.
+/// adapter-formatted [`DetailGroup`]s shown only in the detail popup. Fetched once
+/// when the popup opens; the Server returns the last-known detail while the track
+/// lives — including the whole *lost* window, with `state` marking it (ADR-0007) —
+/// and `404`s only once it ages out for good.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FlightDetail {
     #[serde(flatten)]
@@ -146,8 +176,8 @@ pub struct FlightDetail {
 }
 
 /// `GET /nearest` — the single **Nearest flight** (smallest ground distance from
-/// Home) if any, else `flight: null` with a `200` (the "if any"). What the waybar
-/// module reads.
+/// Home) if any, else `flight: null` with a `200` (the "if any"). A compact
+/// single-flight view, distinct from `/picture`'s full set.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NearestResponse {
     /// Request instant, epoch seconds.
@@ -242,6 +272,7 @@ mod tests {
             squawk: Some("0521".into()),
             emergency: None,
             emitter_category: Some("large".into()),
+            state: ContactState::InContact,
             age_s: 1.85,
             cpa: Some(Cpa {
                 time_to_cpa_s: 135.7,
@@ -270,8 +301,9 @@ mod tests {
 
         // `type`, not `aircraft_type`.
         assert_eq!(v["type"], "B738");
-        // Enum is snake_case.
+        // Enums are snake_case.
         assert_eq!(v["vertical_trend"], "descend");
+        assert_eq!(v["state"], "in_contact");
         // Absent optional is an explicit null, not omitted.
         assert!(v.get("operator").is_some());
         assert!(v["operator"].is_null());
@@ -281,6 +313,17 @@ mod tests {
         assert_eq!(v["hex"], "abc123");
         assert_eq!(v["details"][0]["title"], "Signal");
         assert_eq!(v["details"][0]["fields"][0]["label"], "RSSI");
+    }
+
+    /// The contact-state wire values are the snake_case strings a Client matches on
+    /// (ADR-0007). Pinned here so renaming a variant can't silently break clients.
+    #[test]
+    fn contact_state_wire_values_are_pinned() {
+        let v = |s: ContactState| serde_json::to_value(s).unwrap();
+        assert_eq!(v(ContactState::InContact), "in_contact");
+        assert_eq!(v(ContactState::Landed), "landed");
+        assert_eq!(v(ContactState::LeftScope), "left_scope");
+        assert_eq!(v(ContactState::LostContact), "lost_contact");
     }
 
     /// Every response type round-trips, so a Client deserializes exactly what the

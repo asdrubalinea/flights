@@ -18,7 +18,7 @@ use flights_api as api;
 use crate::config::Config;
 use crate::domain::VerticalTrend;
 use crate::geo::Cpa;
-use crate::tracker::{Health, Track, Tracker};
+use crate::tracker::{ContactState, Health, LostReason, Track, Tracker};
 
 /// `GET /nearest`: the single Nearest flight (smallest ground distance), or
 /// `flight: null` when the airspace is empty.
@@ -55,8 +55,9 @@ pub fn picture(tracker: &RwLock<Tracker>) -> api::PictureResponse {
 }
 
 /// `GET /flight/{hex}`: one flight's full detail (promoted fields plus the opaque
-/// grouped `details`), or `None` once it has left the area (the handler maps that
-/// to a `404`).
+/// grouped `details`), or `None` once the track has aged out (the handler maps that
+/// to a `404`). A *lost* flight is still in the picture, so its last-known detail is
+/// returned with `state` marking it lost — the popup survives the whole lost window.
 pub fn flight_detail(tracker: &RwLock<Tracker>, hex: &str) -> Option<api::FlightDetail> {
     let now = Instant::now();
     let t = read(tracker);
@@ -110,8 +111,20 @@ fn wire_flight(t: &Track) -> api::Flight {
         squawk: f.squawk.clone(),
         emergency: f.emergency.clone(),
         emitter_category: f.emitter_category.clone(),
+        state: wire_contact(t.contact),
         age_s: dur_s(t.age),
         cpa: t.cpa.map(wire_cpa),
+    }
+}
+
+/// Map the domain [`ContactState`] to the wire [`api::ContactState`], flattening
+/// the `Lost(reason)` pair into the wire's four-value enum (ADR-0007).
+fn wire_contact(c: ContactState) -> api::ContactState {
+    match c {
+        ContactState::InContact => api::ContactState::InContact,
+        ContactState::Lost(LostReason::Landed) => api::ContactState::Landed,
+        ContactState::Lost(LostReason::LeftScope) => api::ContactState::LeftScope,
+        ContactState::Lost(LostReason::LostContact) => api::ContactState::LostContact,
     }
 }
 
@@ -281,5 +294,32 @@ mod tests {
         let p = picture(&t);
         assert!(p.tracks.is_empty());
         assert!(p.pacing_hex.is_none());
+    }
+
+    #[test]
+    fn a_lost_flight_carries_its_contact_state_on_the_wire() {
+        // First poll has both flights; a second successful poll omits "gone", so it
+        // is retained as lost (ADR-0007) and must surface that on the wire.
+        let now = Instant::now();
+        let mut tr = Tracker::new(area(), tracker_cfg());
+        tr.ingest(Snapshot::new(
+            vec![
+                moving("gone", 0.05, 0.0, 0.0, 400.0),
+                moving("here", 0.2, 0.0, 0.0, 400.0),
+            ],
+            now,
+        ));
+        tr.ingest(Snapshot::new(vec![moving("here", 0.2, 0.0, 0.0, 400.0)], now));
+        let t = Arc::new(RwLock::new(tr));
+
+        let resp = picture(&t);
+        let gone = resp
+            .tracks
+            .iter()
+            .find(|f| f.hex == "gone")
+            .expect("the omitted flight is retained, not dropped");
+        assert_ne!(gone.state, api::ContactState::InContact);
+        let here = resp.tracks.iter().find(|f| f.hex == "here").unwrap();
+        assert_eq!(here.state, api::ContactState::InContact);
     }
 }

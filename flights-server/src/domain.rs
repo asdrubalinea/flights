@@ -149,12 +149,22 @@ pub const MOVING_FLOOR_KT: f64 = 1.0;
 /// flight — below the noise floor of a meaningful climb or descent.
 pub const VERTICAL_LEVEL_FLOOR_FPM: f64 = 100.0;
 
-/// A **Snapshot**: the complete set of airborne flights in the Search area as of
-/// a single poll. A new Snapshot replaces the previous one wholesale — flights it
-/// omits have left the area.
+/// A **Snapshot**: one poll's contribution to the held state — the airborne flights
+/// it returned in the Search area, authoritative as of its timestamp. The
+/// [`crate::tracker::Tracker`] **merges** a Snapshot into its retained set of tracks
+/// rather than swapping it in wholesale (ADR-0007): a flight a poll reports is *in
+/// contact*; one it omits is kept and becomes *lost*, not assumed gone. This
+/// reverses the older "omitted ⇒ left the area" rule, which turned feed jitter into
+/// flicker.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub flights: Vec<Flight>,
+    /// Hexes the poll reported **on the ground** (`alt_baro == "ground"`). The
+    /// airborne-only invariant (ADR-0003) is relaxed only at this seam: the adapter
+    /// still maps just airborne aircraft to [`Flight`]s, but carries ground hexes so
+    /// the Tracker can turn an *already-tracked* hex to **landed**. Untracked ground
+    /// hexes are ignored — no new ground blips appear.
+    pub on_ground: Vec<String>,
     /// When *this process* received the Snapshot, on the local monotonic clock —
     /// the basis for dead reckoning and staleness. Provider epoch timestamps are
     /// deliberately not used as the time base, so clock skew can't corrupt it.
@@ -162,8 +172,22 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// A Snapshot with no on-ground reports — a test convenience. Production builds
+    /// every Snapshot through the adapter, which always uses [`Snapshot::with_ground`]
+    /// (with a possibly-empty ground list), so this exists only under `cfg(test)`.
+    #[cfg(test)]
     pub fn new(flights: Vec<Flight>, taken_at: Instant) -> Self {
-        Self { flights, taken_at }
+        Self::with_ground(flights, Vec::new(), taken_at)
+    }
+
+    /// A Snapshot that also carries the hexes a poll reported on the ground, so the
+    /// Tracker can mark an already-tracked flight **landed** (see [`Snapshot::on_ground`]).
+    pub fn with_ground(flights: Vec<Flight>, on_ground: Vec<String>, taken_at: Instant) -> Self {
+        Self {
+            flights,
+            on_ground,
+            taken_at,
+        }
     }
 }
 

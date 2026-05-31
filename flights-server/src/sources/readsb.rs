@@ -114,14 +114,32 @@ fn retry_after(resp: &ureq::http::Response<ureq::Body>) -> Option<Duration> {
     (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs))
 }
 
-/// Parse a readsb point-query body into a domain [`Snapshot`], filtering out
-/// on-ground aircraft and any without a position. Pure and `&str`-based so it can
-/// be tested against the golden fixture without a network call.
+/// Parse a readsb point-query body into a domain [`Snapshot`]. Airborne aircraft
+/// with a position become [`Flight`]s; aircraft the feed reports **on the ground**
+/// contribute only their hex to `on_ground` (ADR-0007), so the Tracker can mark an
+/// already-tracked flight *landed* without ever creating a new ground blip. Pure and
+/// `&str`-based so it can be tested against the golden fixture without a network call.
 fn parse_snapshot(body: &str, taken_at: Instant) -> Result<Snapshot, SourceError> {
     let wire: WireResponse =
         serde_json::from_str(body).map_err(|e| SourceError::Decode(e.to_string()))?;
-    let flights = wire.ac.into_iter().filter_map(to_flight).collect();
-    Ok(Snapshot::new(flights, taken_at))
+
+    let mut flights = Vec::new();
+    let mut on_ground = Vec::new();
+    for w in wire.ac {
+        if is_on_ground(&w) {
+            on_ground.push(w.hex);
+        } else if let Some(f) = to_flight(w) {
+            flights.push(f);
+        }
+    }
+    Ok(Snapshot::with_ground(flights, on_ground, taken_at))
+}
+
+/// Whether a wire aircraft is on the ground (`alt_baro == "ground"`). Such an
+/// aircraft is not an airborne [`Flight`]; ADR-0007 keeps its hex so an
+/// *already-tracked* flight that has touched down can be marked **landed**.
+fn is_on_ground(w: &WireAircraft) -> bool {
+    matches!(&w.alt_baro, Some(Altitude::Label(s)) if s.eq_ignore_ascii_case("ground"))
 }
 
 #[derive(Deserialize)]
@@ -241,16 +259,16 @@ enum Altitude {
     Label(String),
 }
 
-/// Map one wire aircraft into a domain [`Flight`], or `None` if it should be
-/// dropped (on the ground, or no position to place it).
+/// Map one airborne wire aircraft into a domain [`Flight`], or `None` if it has no
+/// position to place it. On-ground aircraft are routed to `on_ground` upstream by
+/// [`is_on_ground`] and never reach here.
 fn to_flight(w: WireAircraft) -> Option<Flight> {
     let (lat, lon) = (w.lat?, w.lon?);
 
     let altitude_ft = match &w.alt_baro {
         Some(Altitude::Feet(ft)) => Some(*ft),
-        // On the ground — not an airborne flight.
-        Some(Altitude::Label(s)) if s.eq_ignore_ascii_case("ground") => return None,
-        // Some other label, or no altitude reported: airborne, altitude unknown.
+        // A non-numeric label (or no altitude): airborne, altitude unknown. The
+        // `"ground"` label was already filtered out in `parse_snapshot`.
         Some(Altitude::Label(_)) | None => None,
     };
 
@@ -457,7 +475,11 @@ mod tests {
         // a position (see the live-payload analysis when the fixture was saved).
         assert_eq!(snap.flights.len(), 105);
 
-        // No on-ground aircraft survived the filter.
+        // The 61 on-ground aircraft are kept as bare hexes (ADR-0007), not as
+        // flights — so the Tracker can land an already-tracked hex, but no new
+        // ground blip is ever created.
+        assert_eq!(snap.on_ground.len(), 61);
+        // No on-ground aircraft survived into the airborne flights.
         assert!(snap
             .flights
             .iter()
@@ -491,13 +513,16 @@ mod tests {
     }
 
     #[test]
-    fn alt_baro_ground_string_drops_aircraft() {
+    fn alt_baro_ground_string_routes_hex_to_on_ground() {
         let body = r#"{"ac":[
             {"hex":"aaa","lat":1.0,"lon":2.0,"alt_baro":"ground","gs":5.0},
             {"hex":"bbb","lat":3.0,"lon":4.0,"alt_baro":12000,"alt_geom":12500,"gs":300.0,"track":90.0,"baro_rate":-640,"seen_pos":2.5,"t":"B738","desc":"BOEING 737-800","r":"N1","ownOp":"ACME","squawk":"1200","emergency":"none","category":"A3"}
         ]}"#;
         let snap = parse_snapshot(body, Instant::now()).unwrap();
+        // The ground aircraft is not a flight, but its hex is retained so the
+        // Tracker can mark an already-tracked "aaa" as landed (ADR-0007).
         assert_eq!(snap.flights.len(), 1);
+        assert_eq!(snap.on_ground, vec!["aaa".to_string()]);
         let f = &snap.flights[0];
         assert_eq!(f.hex, "bbb");
         assert_eq!(f.altitude_ft, Some(12000.0));

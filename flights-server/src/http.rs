@@ -26,9 +26,9 @@ use crate::api as map;
 use crate::tracker::Tracker;
 
 /// Worker threads serving requests in parallel. A handful is plenty: each request
-/// is a read-lock + dead-reckon + JSON encode, and the only clients are a TUI at a
-/// few fps plus a waybar one-liner. More than one lets a slow client not stall the
-/// others.
+/// is a read-lock + dead-reckon + JSON encode, and the only client is a TUI at a
+/// few fps (making concurrent picture/detail requests). More than one worker lets a
+/// slow request not stall the others.
 const WORKERS: usize = 4;
 
 /// Bind the API socket. Split from [`serve`] so the caller can learn the actual
