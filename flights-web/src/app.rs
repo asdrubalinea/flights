@@ -79,10 +79,15 @@ pub fn App() -> impl IntoView {
                     Ok(None) => DetailView::LeftArea,
                     Err(e) => DetailView::Error(e.to_string()),
                 };
-                // Apply this response only if the selection hasn't moved on while
-                // the fetch was in flight — otherwise a slower earlier `/flight`
-                // could overwrite the detail of a flight we've since switched to.
-                if selected.get_untracked().as_deref() == Some(hex.as_str()) {
+                // Apply this response only if it's still wanted. Two ways it may
+                // not be: the selection moved on while the fetch was in flight (a
+                // slower earlier `/flight` would otherwise overwrite a flight we've
+                // since switched to), or a poll has since flagged this flight as
+                // having left the Picture — the latest Picture is authoritative, so
+                // a `/flight` issued before it left must not un-flag it back to detail.
+                let still_selected = selected.get_untracked().as_deref() == Some(hex.as_str());
+                let left_since = detail.with_untracked(|d| matches!(d, Some(DetailView::LeftArea)));
+                if still_selected && !left_since {
                     detail.set(Some(view));
                 }
             });
@@ -93,9 +98,20 @@ pub fn App() -> impl IntoView {
 
     // Poll `/picture` every frame; lazily fetch `/meta` until it loads (so the page
     // opened before the Server still connects, retrying each tick with no sleep).
+    //
+    // `polling` keeps a single `/picture` in flight: if the previous one hasn't
+    // returned by the next tick — a high `?fps=` against a slow or remote `?server=`,
+    // never loopback — we skip that tick rather than stack a second request. With at
+    // most one request outstanding, responses also can't arrive out of order and
+    // clobber a newer Picture. Set before the request, cleared on every exit path.
+    let polling = RwSignal::new(false);
     {
         let client = client.clone();
         let poll = move || {
+            if polling.get_untracked() {
+                return; // previous /picture still in flight — let it land first
+            }
+            polling.set(true);
             let client = client.clone();
             spawn_local(async move {
                 if meta.with_untracked(|m| m.is_none()) {
@@ -119,6 +135,7 @@ pub fn App() -> impl IntoView {
                     }
                     Err(e) => conn.set(Conn::Down(e.to_string())),
                 }
+                polling.set(false); // request done — let the next tick poll again
             });
         };
         poll(); // fetch immediately rather than waiting a whole frame
