@@ -1,17 +1,21 @@
 [workspace]
 resolver = "2"
-members = ["flights-api", "flights-server", "flights-tui", "flights-web"]
+members = ["flights-api", "flights-server", "flights-tui", "flights-waybar", "flights-web"]
 
 # `flights-web` is a wasm32 crate (ADR-0007): it shares this lockfile and the
 # `flights-api` path dependency, but it must never enter a host-target build.
 # Keeping it out of `default-members` means a bare `cargo build` / `cargo test` /
 # `cargo clippy` — and the Nix `buildRustPackage`, which builds the default set —
-# touch only the three host crates; the webclient is built solely by Trunk for
+# touch only the host crates; the webclient is built solely by Trunk for
 # `wasm32-unknown-unknown`. Its leptos/wasm deps live in `flights-web/Cargo.toml`,
 # not the shared table below, since no host crate shares them.
-default-members = ["flights-api", "flights-server", "flights-tui"]
+#
+# `flights-waybar`, by contrast, is a host binary (ADR-0008): it *is* in
+# `default-members`, so the existing `flights` derivation carries it on PATH next to
+# `flights`/`flights-server` — no new derivation, unlike the wasm webclient.
+default-members = ["flights-api", "flights-server", "flights-tui", "flights-waybar"]
 
-# Shared metadata and dependency versions, so the three crates stay in lockstep
+# Shared metadata and dependency versions, so the crates stay in lockstep
 # (ADR-0005: the wire contract is shared, so the two sides must not drift).
 [workspace.package]
 version = "0.1.0"

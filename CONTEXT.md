@@ -19,12 +19,15 @@ the only thing that talks to a Source and the sole source of truth.
 _Avoid_: "backend", "daemon" as domain terms (just "the Server").
 
 **Client**:
-Any consumer of the Server's API that only *renders* — the TUI and the future
-webclient. A Client chooses *what* to show and *how often* to ask, but
+Any consumer of the Server's API that only *renders* — the TUI, the webclient, and
+the **waybar module**. A Client chooses *what* to show and *how often* to ask, but
 never computes which flight is nearest or where a blip belongs; that is always the
 Server's answer. Whether a flight is close enough to be worth showing is Client
-policy, distinct from **Relevance distance** (which gates the Server's pacing,
-never a Client's display).
+policy: the radar shows *every* flight in the Search area, while the single-line
+waybar module shows only the **Nearest flight**, and only while it sits within that
+module's **Display range** (else the bar stays empty). This display policy is
+distinct from **Relevance distance** (which gates the Server's pacing, never a
+Client's display).
 _Note_: projecting the Server's answer onto a particular screen — polar
 (`distance_nm`, `bearing_deg`) → pixels on a canvas of a given size, scaled to the
 viewport — is display, not geometry. A Client may scale and place blips for its own
@@ -71,6 +74,19 @@ no matter how soon it passes. Bounded by the Search area — we cannot pace on w
 we cannot see.
 _Note_: this gates *pacing only*, never the display. The radar and list always
 show every flight in the Search area; "relevant" never means "the only ones shown."
+
+**Display range**:
+The ground-distance cutoff a Client uses to decide whether the **Nearest flight**
+is close enough to be worth putting on screen at all. Purely Client display policy:
+it never reaches the Server, and is deliberately a *third*, distinct distance from
+both the **Search area** radius (the Server's coverage) and the **Relevance
+distance** (the Server's pacing gate). A Client may show nothing while the Nearest
+flight lies beyond its Display range, even though the Server still tracks it and
+still answers `/nearest` with it. Where the radar shows every flight in the Search
+area, a single-line bar Client uses a Display range to stay quiet until something is
+genuinely overhead.
+_Avoid_: "Relevance distance" (that gates *Server* pacing), "radius" / "Search
+area" (Server coverage). Different number, different owner, different purpose.
 
 **Pacing flight**:
 Among approaching flights whose CPA distance is within the Relevance distance,

@@ -1,0 +1,20 @@
+[package]
+name = "flights-waybar"
+description = "Waybar status module — a one-shot Client that prints the nearest flight from the flights Server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# A host binary (ADR-0008), unlike the wasm `flights-web`: it joins `default-members`
+# so the existing `flights` derivation carries it on PATH next to `flights-server`.
+[[bin]]
+name = "flights-waybar"
+path = "src/main.rs"
+
+[dependencies]
+flights-api = { workspace = true }
+ureq = { workspace = true }       # the same Server client the TUI uses, not a Source
+serde = { workspace = true }      # serialize the Waybar object, deserialize the config
+serde_json = { workspace = true } # the Waybar JSON line on stdout
+toml = { workspace = true }       # client config (server URL, display range)
+anyhow = { workspace = true }

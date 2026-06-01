@@ -154,23 +154,60 @@ cadence), **selected**, plus approaching vs. receding — and carry a short head
 vector scaled to groundspeed. The detail popup shows everything the source knows
 about an aircraft, including opaque per-source telemetry rendered verbatim.
 
-### 📊 waybar status module
+### 📊 waybar status module (`flights-waybar`)
 
-A one-liner for your status bar showing just the nearest flight, with a tooltip
-of the details. It reads the same `/nearest` endpoint and applies its own
-"only show me something within N nm" display threshold.
+A one-liner for your status bar showing just the **nearest flight** — but only while
+it sits within a **display range** you set (35 nm by default), so the module stays
+empty until something is genuinely overhead. On each Waybar tick it does a single
+`GET /nearest` and prints a Waybar JSON object; the full `Alt/Spd/Trk/Vr` detail
+rides the tooltip.
+
+It's a small Rust binary, not a `curl | jq` line: it reuses the same `flights-api`
+wire types as the TUI, so the schema is checked against the contract rather than
+hand-mirrored ([ADR-0008](docs/adr/0008-waybar-bar-client.md)). And unlike the TUI
+and web launchers it **never starts a server** — a module firing every few seconds
+can't spawn a poller each tick without blowing the single-poller budget. It reads an
+**always-on** `flights-server` (see below) or, failing that, shows a dim error stub.
+
+Wire it into your Waybar config:
 
 ```jsonc
-// ~/.config/waybar/config
+// ~/.config/waybar/config.jsonc
 "custom/flights": {
-  "exec": "~/.config/waybar/flights-nearest.sh",
+  "exec": "flights-waybar",
   "return-type": "json",
   "interval": 5
 }
 ```
 
-Override `FLIGHTS_URL` and `FLIGHTS_MAX_NM` via the environment. Needs only `curl`
-and `jq`. (Script: [`waybar/flights-nearest.sh`](waybar/flights-nearest.sh))
+Style the states in your Waybar CSS — the module sets a `class` of `lost` (the
+nearest flight froze: retained and badged, never dropped), `stale` (the whole picture
+has aged), or `error` (server unreachable / no data). An empty sky emits empty text
+and Waybar collapses the module:
+
+```css
+#custom-flights.lost  { color: #928374; }
+#custom-flights.stale { color: #d79921; }
+#custom-flights.error { color: #cc241d; }
+```
+
+#### Always-on server via Home Manager
+
+The flake exports `homeManagerModules.default`, which runs `flights-server` as a
+**systemd user service** (started with your graphical session, beside Waybar) and
+puts `flights-waybar` (and `flights`) on your PATH:
+
+```nix
+# home.nix — with the flake added to your inputs as `flights`
+{ inputs, ... }:
+{
+  imports = [ inputs.flights.homeManagerModules.default ];
+  services.flights-server.enable = true;
+}
+```
+
+`programs.waybar` stays yours — add the `custom/flights` snippet above to it. Set
+`[home]` in `~/.config/flights/config.toml` so the server measures from your location.
 
 ### 🌐 Web client — *planned*
 
@@ -220,6 +257,18 @@ url = "http://127.0.0.1:7878"  # which engine to read
 [render]
 fps = 4                        # redraw rate — costs zero API calls
 ```
+
+### waybar module — `waybar.toml`
+
+```toml
+[server]
+url = "http://127.0.0.1:7878"  # which engine to read
+
+[display]
+range_nm = 35.0                # stay empty until the nearest flight is this close
+```
+
+Both can be overridden per-run: `flights-waybar --server <URL> --display-range <NM>`.
 
 ---
 
@@ -293,8 +342,9 @@ flights/
 ├── flights-api/      shared REST wire types — the contract between server & clients
 ├── flights-server/   the engine: source adapters, poller, tracker, geometry, HTTP
 ├── flights-tui/      the radar TUI client (binary: `flights`)
-├── waybar/           the status-bar module script
-├── scripts/          flights-radar — the server+TUI launcher
+├── flights-waybar/   the status-bar client — one-shot /nearest reader (binary: `flights-waybar`)
+├── flights-web/      the Leptos/WASM webclient (built by Trunk)
+├── scripts/          flights-radar / flights-web — the server+client launchers
 ├── docs/adr/         architecture decision records
 └── CONTEXT.md        the domain language (read this first)
 ```
@@ -306,7 +356,7 @@ flights/
 ```sh
 nix develop          # drops you into a shell with the pinned toolchain + tools
 cargo build          # debug build of the whole workspace
-cargo test           # the test suite (engine, wire format, HTTP, TUI rendering)
+cargo test           # the test suite (engine, wire format, HTTP, TUI + waybar rendering)
 cargo run -p flights-server -- --once   # one live fetch, print nearest/pacing, exit
 ```
 

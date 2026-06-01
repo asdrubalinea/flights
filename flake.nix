@@ -36,9 +36,11 @@
         # [workspace.package] rather than a [package] that no longer exists.
         workspace = (pkgs.lib.importTOML ./Cargo.toml).workspace;
 
-        # One derivation builds every workspace member in release mode, so the
-        # output carries both binaries: `flights` (the TUI client) and
-        # `flights-server` (the engine + REST daemon).
+        # One derivation builds every `default-members` crate in release mode, so the
+        # output carries all three host binaries: `flights` (the TUI client),
+        # `flights-server` (the engine + REST daemon), and `flights-waybar` (the
+        # status-bar client — a `default-members` crate per ADR-0008, unlike the wasm
+        # `flights-web`, which Trunk builds separately).
         flights = rustPlatform.buildRustPackage {
           pname = "flights";
           version = workspace.package.version;
@@ -88,7 +90,7 @@
         };
       in
       {
-        # `nix build` / `nix build .#flights` -> ./result/bin/{flights,flights-server}
+        # `nix build` / `nix build .#flights` -> ./result/bin/{flights,flights-server,flights-waybar}
         # `nix build .#radar`                 -> ./result/bin/flights-radar
         packages = {
           default = flights;
@@ -145,5 +147,92 @@
         # `nix fmt`
         formatter = pkgs.nixfmt;
       }
-    );
+    )
+    // {
+      # The Server's first **always-on** deployment (ADR-0008). `flights-waybar` is
+      # a one-shot module firing at ~1 Hz: it must never start a Server itself (that
+      # would swarm pollers against a rate-limited Source and blow the single-poller
+      # budget — ADR-0005), so it reads a Server someone else keeps running. This
+      # module is that someone: a **systemd user service**, since the Server lives in
+      # the user's graphical session beside Waybar and needs no root. `programs.waybar`
+      # stays the user's, wired from the documented `custom/flights` snippet in the
+      # README rather than auto-managed here.
+      #
+      # Not wrapped in `eachDefaultSystem`: a Home Manager module is system-agnostic
+      # and picks the package for the importing config's own `pkgs.system`.
+      homeManagerModules.default =
+        {
+          config,
+          lib,
+          pkgs,
+          ...
+        }:
+        let
+          cfg = config.services.flights-server;
+        in
+        {
+          options.services.flights-server = {
+            enable = lib.mkEnableOption (
+              "the flights nearest-flight Server as a systemd user service "
+              + "(and the flights/flights-waybar Clients on PATH)"
+            );
+
+            package = lib.mkOption {
+              type = lib.types.package;
+              default = self.packages.${pkgs.system}.flights;
+              defaultText = lib.literalExpression "flights.packages.\${system}.flights";
+              description = ''
+                The flights package, carrying the engine (`flights-server`) and the
+                Clients (`flights`, `flights-waybar`) on PATH — one derivation, no
+                wasm (ADR-0008).
+              '';
+            };
+
+            extraArgs = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+              example = [
+                "--config"
+                "%h/.config/flights/config.toml"
+              ];
+              description = ''
+                Extra arguments appended to `flights-server --serve`. By default the
+                Server reads `$XDG_CONFIG_HOME/flights/config.toml`; set `[home]`
+                there to your location.
+              '';
+            };
+          };
+
+          config = lib.mkIf cfg.enable {
+            # Puts `flights-waybar` on PATH for Waybar's `exec`, plus `flights` (TUI)
+            # and `flights-server` for manual use.
+            home.packages = [ cfg.package ];
+
+            # Bound to graphical-session.target so it starts/stops with the session
+            # in lockstep with Waybar. `Restart=on-failure` keeps the always-on
+            # Server up across a transient Source hiccup; the one-poller invariant
+            # holds as long as no on-demand launcher (flights-radar / flights-web) is
+            # pointed at the same Source concurrently (ADR-0005/0008).
+            systemd.user.services.flights-server = {
+              Unit = {
+                Description = "flights nearest-flight Server (engine + local REST API)";
+                PartOf = [ "graphical-session.target" ];
+                After = [ "graphical-session.target" ];
+              };
+              Service = {
+                ExecStart = lib.escapeShellArgs (
+                  [
+                    "${cfg.package}/bin/flights-server"
+                    "--serve"
+                  ]
+                  ++ cfg.extraArgs
+                );
+                Restart = "on-failure";
+                RestartSec = 3;
+              };
+              Install.WantedBy = [ "graphical-session.target" ];
+            };
+          };
+        };
+    };
 }
