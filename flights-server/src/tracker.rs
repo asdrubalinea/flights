@@ -30,8 +30,11 @@ pub struct TrackerConfig {
     /// Snapshot age beyond which the whole picture is flagged *stale* (polling
     /// appears to have stopped). Typically ~2× the max poll interval.
     pub stale_after: Duration,
-    /// Per-flight effective-age beyond which a blip is dropped — the staleness
-    /// cap that stops dead reckoning from showing fiction forever.
+    /// Per-flight **contact age** (time since we last heard the track) beyond which
+    /// a blip is dropped — the staleness cap that stops dead reckoning from showing
+    /// fiction forever. Measured from our own polls, *not* the source's position age
+    /// (`seen_pos`): an aircraft the latest poll still reports stays regardless of how
+    /// stale its last positional fix is.
     pub max_flight_age: Duration,
 }
 
@@ -90,7 +93,8 @@ pub struct Track {
     pub cpa: Option<Cpa>,
     /// Effective age of the underlying report at the query instant
     /// (`reported_age` + time since this track was last seen). For a lost flight
-    /// this is time-since-contact; it drives the staleness cap and the UI fade.
+    /// this is time-since-contact; it drives the dead-reckoning distance and the UI
+    /// fade. (The *drop* decision uses contact age alone — see `max_flight_age`.)
     pub age: Duration,
     /// Contact state at the query instant (see [`ContactState`]).
     pub contact: ContactState,
@@ -268,7 +272,7 @@ impl Tracker {
         // 4. Bound memory: forget tracks already past the cap (also enforced per
         //    query in `resolve`, since more time passes between polls).
         let cap = self.cfg.max_flight_age;
-        self.tracks.retain(|_, rt| effective_age(rt, now) <= cap);
+        self.tracks.retain(|_, rt| contact_age(rt, now) <= cap);
     }
 
     /// Record a poll failure. The retained tracks stay **in contact** and keep being
@@ -349,10 +353,16 @@ impl Tracker {
     /// extrapolated (CONTEXT.md "Dead reckoning"). Either way the CPA is computed
     /// from the resolved position; pacing later ignores the lost ones.
     fn resolve(&self, rt: &RetainedTrack, now: Instant) -> Option<Track> {
-        let age = effective_age(rt, now);
-        if age > self.cfg.max_flight_age {
+        // Drop on time since we last *heard* the track, not on the source's position
+        // age. An aircraft the latest poll still reports is in contact and must not
+        // vanish just because its last positional fix is old — routine on a
+        // fast-polled local receiver, where the cap is only a few seconds yet
+        // `seen_pos` can be tens of seconds. `effective_age` below still folds in the
+        // report age: it drives the dead-reckoning distance and the Client's fade.
+        if contact_age(rt, now) > self.cfg.max_flight_age {
             return None;
         }
+        let age = effective_age(rt, now);
 
         let estimated = match rt.contact {
             ContactState::InContact => match rt.flight.velocity() {
@@ -389,11 +399,20 @@ impl Tracker {
 
 /// Effective age of a track's underlying position report at `now`: how old it was
 /// when last reported, plus time since that poll. It grows for a lost (frozen)
-/// track and for any track under a total poll outage — driving the staleness cap
-/// and the Client's fade. (For a lost track this is "time since contact" plus the
-/// initial report age.)
+/// track and for any track under a total poll outage — driving the dead-reckoning
+/// distance and the Client's fade. (For a lost track this is "time since contact"
+/// plus the initial report age.)
 fn effective_age(rt: &RetainedTrack, now: Instant) -> Duration {
     rt.flight.reported_age + now.saturating_duration_since(rt.last_seen)
+}
+
+/// Time since we last *heard* this track in a poll — the basis for the staleness
+/// drop. Refreshed to ~zero on every poll that reports the track, so a still-reported
+/// aircraft is never dropped for a stale *position* (an old `seen_pos`); for a lost
+/// track it grows as "time since contact". Distinct from [`effective_age`], which
+/// also folds in the source's report age to drive extrapolation and the fade.
+fn contact_age(rt: &RetainedTrack, now: Instant) -> Duration {
+    now.saturating_duration_since(rt.last_seen)
 }
 
 /// The reason a just-omitted track lost contact (landing is resolved separately,
@@ -577,6 +596,36 @@ mod tests {
         // Well past the 120 s cap.
         assert!(tr.tracks_at(t0 + Duration::from_secs(200)).is_empty());
         assert!(tr.nearest_at(t0 + Duration::from_secs(200)).is_none());
+    }
+
+    #[test]
+    fn a_stale_position_survives_while_still_reported() {
+        // Regression: on a fast-polled local receiver the cap is only a few seconds
+        // (3s at max_interval_secs = 1s), but the source keeps reporting aircraft
+        // whose last *position* is tens of seconds old (a large `seen_pos`, mapped to
+        // `reported_age`). Such a track is still in contact and must not be dropped
+        // for a stale position — the drop measures contact age, not report age.
+        let t0 = Instant::now();
+        let cfg = TrackerConfig {
+            relevance_distance_nm: 30.0,
+            stale_after: Duration::from_secs(2),
+            max_flight_age: Duration::from_secs(3),
+        };
+        let f = Flight {
+            // Position 84 s old at snapshot time, but just reported this poll.
+            reported_age: Duration::from_secs(84),
+            ..flight("stale", LatLon::new(0.1, 0.0))
+        };
+        let mut tr = Tracker::new(area(), cfg);
+        tr.ingest(Snapshot::new(vec![f], t0));
+
+        let tracks = tr.tracks_at(t0);
+        assert_eq!(
+            tracks.len(),
+            1,
+            "a still-reported aircraft must survive a stale position under a 3 s cap"
+        );
+        assert_eq!(tracks[0].flight.hex, "stale");
     }
 
     #[test]
