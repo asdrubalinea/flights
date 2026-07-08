@@ -207,6 +207,18 @@ display-only and either may be absent. The Nearest flight is measured by *ground
 distance only — neither altitude is part of it.
 _Avoid_: treating the two as interchangeable; they can differ by hundreds of feet.
 
+**Observed kinematics**:
+What the app actually knows about a flight's motion, all from ADS-B via the
+**Source**: **ground track** (direction over the ground), **groundspeed**,
+**barometric** and **geometric altitude**, and **vertical rate**. These are *not*
+the flight-deck quantities they resemble — the app has **no heading** (only ground
+track, uncorrected for wind), **no airspeed** (only groundspeed), and **no attitude**
+(no pitch or roll at all). A Client may render only these; it must never relabel
+groundspeed as airspeed or ground track as heading, and never draw an attitude it
+does not have.
+_Avoid_: "airspeed", "heading", "attitude" as things the app possesses (it has
+groundspeed, ground track, and none, respectively).
+
 **Registration** (tail number):
 The aircraft's civil registration (e.g. `N292WN`), tied to the airframe rather than
 the flight. Descriptive only.

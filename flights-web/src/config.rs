@@ -5,6 +5,7 @@
 //!
 //! - `?server=http://host:port` — the Server base URL (default `http://127.0.0.1:7878`).
 //! - `?fps=N` — radar refresh rate, clamped to `1..=60` (default `4`).
+//! - `?crt=0` — disable the CRT scanline/curvature overlay (default on; ADR-0009).
 //!
 //! Re-querying the Server costs no Source call, so fps is purely a display concern
 //! (ADR-0005). Note the Server only answers this cross-origin page if it was
@@ -21,6 +22,9 @@ pub struct WebConfig {
     pub server_url: String,
     /// Radar refresh rate (frames per second), already clamped to `1..=60`.
     pub fps: u32,
+    /// Whether to draw the CRT scanline/curvature overlay (ADR-0009). On by default;
+    /// `?crt=0` (or `false`/`off`/`no`) turns it off.
+    pub crt: bool,
 }
 
 impl Default for WebConfig {
@@ -28,6 +32,7 @@ impl Default for WebConfig {
         Self {
             server_url: DEFAULT_SERVER_URL.to_string(),
             fps: DEFAULT_FPS,
+            crt: true,
         }
     }
 }
@@ -63,6 +68,9 @@ impl WebConfig {
                         cfg.fps = n.clamp(1, 60);
                     }
                 }
+                "crt" => {
+                    cfg.crt = !matches!(value, "0" | "false" | "off" | "no");
+                }
                 _ => {}
             }
         }
@@ -86,6 +94,7 @@ mod tests {
         let cfg = WebConfig::from_query("");
         assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
         assert_eq!(cfg.fps, DEFAULT_FPS);
+        assert!(cfg.crt); // CRT overlay on by default
     }
 
     #[test]
@@ -136,5 +145,15 @@ mod tests {
         assert_eq!(with_fps(4).frame_ms(), 250);
         assert_eq!(with_fps(60).frame_ms(), 16); // 1000 / 60 truncates
         assert_eq!(with_fps(1).frame_ms(), 1000);
+    }
+
+    #[test]
+    fn crt_is_on_unless_explicitly_disabled() {
+        assert!(WebConfig::from_query("?crt=1").crt);
+        assert!(WebConfig::from_query("?crt=on").crt);
+        assert!(!WebConfig::from_query("?crt=0").crt);
+        assert!(!WebConfig::from_query("?crt=false").crt);
+        assert!(!WebConfig::from_query("?crt=off").crt);
+        assert!(!WebConfig::from_query("?crt=no").crt);
     }
 }

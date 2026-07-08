@@ -3,21 +3,46 @@
    colours are kept in lockstep with the constants in `display.rs` so a flight
    reads the same on the canvas and in the list. */
 
+/* B612 Mono — the font Airbus commissioned for cockpit screens (OFL; ADR-0009).
+   Self-hosted; Trunk copies the woff2 to the bundle root (see index.html). */
+@font-face {
+  font-family: "B612 Mono";
+  src: url("B612Mono-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "B612 Mono";
+  src: url("B612Mono-Bold.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* Airbus EFIS colour philosophy (ADR-0009): red=warning, amber=caution,
+   green=active, cyan=for-info, magenta=managed-target, white=present. Kept in
+   lockstep with the COL_* constants in display.rs. */
 :root {
-  --bg: #0d1117;
-  --panel: #11161d;
-  --border: #222a35;
-  --fg: #c6ccd4;
-  --dim: #5a6270;
+  --bg: #05080a;
+  --panel: #0a0f12;
+  --border: #16323a;
+  --fg: #cdd6db;
+  --dim: #5b7a86;
 
-  --selected: #f5f6f7;
-  --pacing: #ff6b6b;
-  --nearest: #5fd7ff;
-  --approach: #a6e22e;
-  --recede: #5c9eff;
-  --home: #ffd866;
+  --selected: #eef2f6;
+  --emergency: #ff3b30;
+  --caution: #ffb01f;
+  --pacing: #ff5cf0;
+  --nearest: #25e36a;
+  --approach: #25e36a;
+  --recede: #28d6ff;
+  --home: #eef2f6;
 
-  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  /* Subtle phosphor bloom — "0 0 <blur>", colour appended as currentColor per use. */
+  --glow: 0 0 2px;
+
+  --mono: "B612 Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 * {
@@ -36,9 +61,38 @@ body {
   font-family: var(--mono);
   font-size: 13px;
   line-height: 1.5;
+  /* Faint backlit-display bloom on all text (phosphor glow). */
+  text-shadow: var(--glow) currentColor;
 }
 
-/* ---- layout: radar | (list / status) ---- */
+/* ---- CRT overlay (scaffold; tuned in slice 5). Gated by the `crt` class on
+   `.app`, which app.rs adds unless the page is opened with `?crt=0`. ---- */
+
+.app.crt::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    0deg,
+    rgba(0, 0, 0, 0.16) 0px,
+    rgba(0, 0, 0, 0.16) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+}
+
+.app.crt::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 51;
+  pointer-events: none;
+  background: radial-gradient(ellipse at center, transparent 62%, rgba(0, 0, 0, 0.4) 100%);
+}
+
+/* ---- layout: ND scope | MCDU console ---- */
 
 .app {
   display: grid;
@@ -46,13 +100,6 @@ body {
   gap: 10px;
   height: 100vh;
   padding: 10px;
-}
-
-.side {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  min-height: 0;
 }
 
 .panel {
@@ -91,10 +138,6 @@ body {
 
 /* ---- flight list ---- */
 
-.list-pane {
-  flex: 1 1 auto;
-}
-
 .list-body {
   flex: 1;
   overflow-y: auto;
@@ -103,7 +146,7 @@ body {
 
 .flight-row {
   display: grid;
-  grid-template-columns: minmax(0, 1.5fr) 0.7fr 1.4fr 1.2fr 0.8fr minmax(0, 1.6fr);
+  grid-template-columns: 1.1em minmax(0, 1.5fr) 0.7fr 1.4fr 1.2fr 0.8fr minmax(0, 1.6fr);
   align-items: baseline;
   gap: 6px;
   padding: 2px 10px;
@@ -147,110 +190,7 @@ body {
   color: var(--dim);
 }
 
-/* ---- status ---- */
-
-.status-pane {
-  flex: none;
-}
-
-.status-body {
-  padding: 6px 10px;
-}
-
-.status-line {
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.status-line .state {
-  font-weight: 700;
-}
-
-.status-line.hint,
-.status-line.sel {
-  color: var(--dim);
-  margin-top: 2px;
-}
-
-.status-line.sel {
-  color: var(--fg);
-}
-
-.status-line.err {
-  color: var(--pacing);
-}
-
-/* ---- detail overlay ---- */
-
-.overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 10;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: rgba(0, 0, 0, 0.55);
-}
-
-.modal {
-  width: min(560px, 92vw);
-  max-height: 80vh;
-  display: flex;
-  flex-direction: column;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
-}
-
-.modal-title {
-  flex: none;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 6px 12px;
-  border-bottom: 1px solid var(--border);
-  color: var(--dim);
-  text-transform: uppercase;
-  letter-spacing: 0.12em;
-  font-size: 11px;
-}
-
-.modal-close {
-  background: none;
-  border: none;
-  color: var(--dim);
-  font-size: 18px;
-  line-height: 1;
-  cursor: pointer;
-  padding: 0 4px;
-}
-
-.modal-close:hover {
-  color: var(--fg);
-}
-
-.modal-body {
-  flex: 1;
-  overflow-y: auto;
-  padding: 10px 14px;
-}
-
-.modal-footer {
-  flex: none;
-  padding: 6px 12px;
-  border-top: 1px solid var(--border);
-  color: var(--dim);
-  font-size: 11px;
-}
-
-.d-header {
-  font-weight: 700;
-  font-size: 15px;
-  color: var(--selected);
-  margin-bottom: 4px;
-}
+/* ---- detail fields (used by the in-console DETAIL page) ---- */
 
 .d-section {
   margin-top: 10px;
@@ -278,4 +218,235 @@ body {
   color: var(--dim);
   text-align: center;
   padding: 20px 0;
+}
+
+/* ---- MCDU console (ADR-0009): title + page counter, mode-switched body, a
+   persistent status strip, and the scratchpad ---- */
+
+.console-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.console-title .state {
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.state.ok {
+  color: var(--nearest);
+} /* green — LIVE */
+.state.caution {
+  color: var(--caution);
+} /* amber — STALE */
+.state.warn {
+  color: var(--emergency);
+} /* red — UNREACHABLE / NO DATA */
+.state.info {
+  color: var(--selected);
+} /* white — CONNECTING */
+
+.console-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* the line-select key marker on each list row */
+.lsk {
+  color: var(--recede);
+  font-weight: 700;
+  text-align: center;
+}
+
+/* list rows echo the scope's role colours */
+.flight-row.lost,
+.flight-row.lost .ident {
+  color: var(--caution);
+}
+.flight-row.emer,
+.flight-row.emer .ident {
+  color: var(--emergency);
+  font-weight: 700;
+}
+
+.status-strip {
+  flex: none;
+  border-top: 1px solid var(--border);
+  padding: 6px 10px;
+}
+
+.strip-line {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.strip-line .k {
+  color: var(--dim);
+}
+
+.scratchpad {
+  flex: none;
+  border-top: 1px solid var(--border);
+  padding: 6px 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--dim);
+}
+
+.scratchpad.sel {
+  color: var(--fg);
+}
+.scratchpad.err {
+  color: var(--emergency);
+}
+
+/* the per-flight DETAIL page lives inside the console (no floating modal) */
+.detail-page {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+}
+
+.detail-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px 12px;
+}
+
+.lsk-back {
+  flex: none;
+  text-align: left;
+  background: none;
+  border: none;
+  border-top: 1px solid var(--border);
+  color: var(--recede);
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+
+.lsk-back:hover {
+  color: var(--selected);
+}
+
+/* ---- the honest instrument cluster (ADR-0009): only ADS-B-derived gauges ---- */
+
+.cluster {
+  padding: 10px 12px 4px;
+}
+
+.cluster-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.cluster-head .ci {
+  font-weight: 700;
+  font-size: 15px;
+  color: var(--selected);
+}
+
+.cluster-head .ck {
+  color: var(--dim);
+}
+
+.cluster-head .cstale {
+  margin-left: auto;
+  color: var(--caution);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.gauges {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.gauge {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 4px;
+  text-align: center;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.gauge.stale {
+  border-color: var(--caution);
+}
+
+.glabel {
+  color: var(--dim);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+}
+
+.gval {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--selected);
+  line-height: 1.2;
+}
+
+.gauge.stale .gval {
+  color: var(--caution);
+}
+
+.gunit {
+  color: var(--recede);
+  font-size: 11px;
+}
+
+.gauge-lines {
+  margin-bottom: 8px;
+}
+
+.gline {
+  white-space: nowrap;
+  padding: 1px 0;
+}
+
+.gline .k {
+  color: var(--dim);
+}
+
+.cemer {
+  color: var(--emergency);
+  font-weight: 700;
+}
+
+/* ---- ECAM-style master warning: a blinking red banner on any emergency ---- */
+
+.master-warning {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 100;
+  padding: 6px 18px;
+  border: 1px solid var(--emergency);
+  border-radius: 4px;
+  background: rgba(255, 59, 48, 0.16);
+  color: var(--emergency);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-shadow: 0 0 6px var(--emergency);
+  animation: master-warning-blink 1s steps(2, start) infinite;
+}
+
+@keyframes master-warning-blink {
+  50% {
+    opacity: 0.3;
+  }
 }

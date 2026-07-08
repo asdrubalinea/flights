@@ -176,7 +176,18 @@ Wire it into your Waybar config:
 "custom/flights": {
   "exec": "flights-waybar",
   "return-type": "json",
-  "interval": 5
+  "interval": 5,
+
+  // Optional: click the module to open the TUI — but launch it DETACHED.
+  // A bare on-click command inherits Waybar's session and open file
+  // descriptors; a long-lived child (a terminal, e.g. `kitty --single-instance`)
+  // then holds this module's stdout pipe open, so the interval poll never sees
+  // EOF and the bar freezes on its last value (Waybar #4608). `setsid -f`
+  // reparents it away; on Hyprland/Sway `hyprctl dispatch exec` / `swaymsg exec`
+  // are equally clean. Pair it with `exec-on-event: false` so clicking doesn't
+  // also re-run the poll straight into the same race.
+  "on-click": "setsid -f kitty -e flights",
+  "exec-on-event": false
 }
 ```
 
@@ -208,6 +219,22 @@ puts `flights-waybar` (and `flights`) on your PATH:
 
 `programs.waybar` stays yours — add the `custom/flights` snippet above to it. Set
 `[home]` in `~/.config/flights/config.toml` so the server measures from your location.
+
+To also serve the web client beside the always-on server, flip `web.enable`. It
+adds a second user service that hands out the compiled bundle (`nix build .#web-dist`
+— Trunk's static wasm/js/css output) over `static-web-server`, and opts the server
+into the page's origin over CORS for you:
+
+```nix
+services.flights-server = {
+  enable = true;
+  web.enable = true;      # serves http://127.0.0.1:8080 by default
+  # web.port = 8080;      # and wires --cors-allow-origin to match
+};
+```
+
+Bind it to the LAN with `web.address = "0.0.0.0"`, but then set `web.corsOrigin` to
+the origin the browser actually uses (`address` is a bind address, not an origin).
 
 ### 🌐 Web client — *planned*
 

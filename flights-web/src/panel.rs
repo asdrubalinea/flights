@@ -1,34 +1,127 @@
-//! The right column: the flight **list** (nearest-first, the order the Server
-//! sends) and the **status** block. Both read the same Picture the radar does, so
-//! the three never disagree (ADR-0005). Clicking a row opens that flight's detail;
-//! the status block mirrors the TUI's — source, health, counts, the Nearest and
-//! Pacing flights, and the Relevance distance.
+//! The right column — the **MCDU console** (ADR-0009). One panel that owns the
+//! AIRSPACE list, the per-flight DETAIL page, a persistent status strip, and the
+//! scratchpad. The body switches on [`Mode`]; the strip and scratchpad sit *outside*
+//! that switch, so live traffic/health are never hidden behind a page flip. It reads
+//! the same Picture the scope does, so the two never disagree (ADR-0005).
 
 use leptos::prelude::*;
 
 use flights_api::{Flight, Health, Meta, PictureResponse};
 
-use crate::app::Conn;
+use crate::app::{Conn, DetailView, Mode};
+use crate::detail::detail_page;
 use crate::display::*;
 
 #[component]
-pub fn FlightList(
+pub fn Console(
+    meta: RwSignal<Option<Meta>>,
+    picture: RwSignal<Option<PictureResponse>>,
+    conn: RwSignal<Conn>,
+    selected: RwSignal<Option<String>>,
+    mode: RwSignal<Mode>,
+    detail: RwSignal<Option<DetailView>>,
+    open: Callback<String>,
+    close: Callback<()>,
+) -> impl IntoView {
+    // Title: page name + counter, with the connection/health badge on the right.
+    let title = move || {
+        let (name, page) = match mode.get() {
+            Mode::Radar => ("AIRSPACE", 1),
+            Mode::Detail => ("DETAIL", 2),
+        };
+        let (label, class) = conn_state(conn.get(), picture.get());
+        view! {
+            <span>{format!("{name}  {page}/2")}</span>
+            <span class=format!("state {class}")>{format!("[{label}]")}</span>
+        }
+    };
+
+    // The body switches on `Mode` *only* — each page carries its own reactive closure
+    // (the list re-rows on each poll, the detail re-renders on each `/flight`), so a
+    // poll repaints the inner content without rebuilding the console chrome.
+    let body = move || match mode.get() {
+        Mode::Radar => airspace_page(picture, selected, open),
+        Mode::Detail => detail_page(picture, selected, detail, close),
+    };
+
+    // Persistent status strip: Nearest / Pacing / Relevance + Snapshot age.
+    let strip = move || {
+        let pic = picture.get();
+        let tracks = pic.as_ref().map(|p| p.tracks.clone()).unwrap_or_default();
+        let pacing_hex = pic.as_ref().and_then(|p| p.pacing_hex.clone());
+        let nearest = tracks
+            .first()
+            .map(fmt_position)
+            .unwrap_or_else(|| "(none)".into());
+        let pacing = pacing_hex
+            .as_deref()
+            .and_then(|h| tracks.iter().find(|t| t.hex == h))
+            .map(fmt_pacing)
+            .unwrap_or_else(|| "quiet — backing off".into());
+        let relevance = meta
+            .get()
+            .map(|m| format!("{:.0}nm", m.relevance_nm))
+            .unwrap_or_else(|| "—".into());
+        let age = pic
+            .as_ref()
+            .and_then(|p| p.snapshot_age_s)
+            .map(|s| format!("{s:.0}s"))
+            .unwrap_or_else(|| "—".into());
+        view! {
+            <div class="strip-line"><span class="k">"N  "</span>{nearest}</div>
+            <div class="strip-line"><span class="k">"P  "</span>{pacing}</div>
+            <div class="strip-line">
+                <span class="k">"REL"</span>{format!(" {relevance}  ·  {age} old")}
+            </div>
+        }
+    };
+
+    // Scratchpad: a live error (amber), then the selected flight, else the key hint.
+    let scratch = move || {
+        let error = match conn.get() {
+            Conn::Down(e) => Some(e),
+            _ => picture.with(|p| {
+                p.as_ref().and_then(|p| match p.health {
+                    Health::Live => None,
+                    _ => p.last_error.clone(),
+                })
+            }),
+        };
+        let sel = selected.get().and_then(|h| {
+            picture.with(|p| {
+                p.as_ref().and_then(|p| {
+                    p.tracks.iter().find(|t| t.hex == h).map(|t| {
+                        let kind = t.aircraft_type.as_deref().unwrap_or("?");
+                        format!("SEL {} · {kind} · {:.0}s", label(t), t.age_s)
+                    })
+                })
+            })
+        });
+        let (text, class) = scratchpad_line(error.as_deref(), sel.as_deref());
+        view! { <div class=format!("scratchpad {class}")>{text}</div> }
+    };
+
+    view! {
+        <div class="panel console">
+            <div class="panel-title console-title">{title}</div>
+            <div class="console-body">{body}</div>
+            <div class="status-strip">{strip}</div>
+            {scratch}
+        </div>
+    }
+}
+
+/// The AIRSPACE page: the nearest-first flight list, each row a line-select key
+/// (LSK) that opens that flight's DETAIL. Built as a free function with its own
+/// reactive `rows` closure, so the console's body switch only re-runs on `Mode`.
+fn airspace_page(
     picture: RwSignal<Option<PictureResponse>>,
     selected: RwSignal<Option<String>>,
     open: Callback<String>,
-) -> impl IntoView {
-    let count = move || {
-        picture
-            .get()
-            .map(|p| p.tracks.len())
-            .unwrap_or(0)
-    };
+) -> AnyView {
     let rows = move || {
         let pic = picture.get();
-        let tracks = pic
-            .as_ref()
-            .map(|p| p.tracks.clone())
-            .unwrap_or_default();
+        let tracks = pic.as_ref().map(|p| p.tracks.clone()).unwrap_or_default();
         let pacing = pic.as_ref().and_then(|p| p.pacing_hex.clone());
         let sel = selected.get();
         tracks
@@ -40,18 +133,13 @@ pub fn FlightList(
             })
             .collect_view()
     };
-
-    view! {
-        <div class="panel list-pane">
-            <div class="panel-title">{move || format!("flights · {}", count())}</div>
-            <div class="list-body">{rows}</div>
-        </div>
-    }
+    view! { <div class="list-body">{rows}</div> }.into_any()
 }
 
-/// One list row. A click opens the flight's detail (and selects it). Mirrors the
-/// TUI row's columns: callsign, type, distance/bearing, altitude + trend glyph,
-/// groundspeed, then the CPA arrow and figures.
+/// One LSK row. A click opens the flight's DETAIL (and selects it). Columns mirror
+/// the TUI: the `<` line-select marker, callsign, type, distance/bearing, altitude +
+/// trend glyph, groundspeed, then the CPA arrow and figures. Lost/emergency rows pick
+/// up the same caution/warning colours the scope uses (ADR-0009).
 fn flight_row(t: Flight, is_sel: bool, is_pacing: bool, open: Callback<String>) -> impl IntoView {
     let hex = t.hex.clone();
     let name = label(&t);
@@ -83,14 +171,23 @@ fn flight_row(t: Flight, is_sel: bool, is_pacing: bool, open: Callback<String>) 
     } else {
         "cell ident"
     };
-    let row_class = if is_sel {
-        "flight-row selected"
-    } else {
-        "flight-row"
+    // Row class echoes the scope's role colours: warning (emergency) ▸ caution (lost).
+    let row_class = {
+        let mut c = String::from("flight-row");
+        if is_sel {
+            c.push_str(" selected");
+        }
+        if t.emergency.is_some() {
+            c.push_str(" emer");
+        } else if t.state != flights_api::ContactState::InContact {
+            c.push_str(" lost");
+        }
+        c
     };
 
     view! {
         <div class=row_class on:click=move |_| open.run(hex.clone())>
+            <span class="cell lsk">"<"</span>
             <span class=ident_class>{name}</span>
             <span class="cell kind">{kind}</span>
             <span class="cell pos">{pos}</span>
@@ -108,109 +205,44 @@ fn flight_row(t: Flight, is_sel: bool, is_pacing: bool, open: Callback<String>) 
     }
 }
 
+/// The ECAM-style master warning: a red, blinking banner shown whenever any track is
+/// broadcasting an emergency (ADR-0009). Keyed off the Server's `emergency` field via
+/// [`any_emergency`], never the client interpreting squawk codes (CONTEXT.md,
+/// *Squawk*). Renders nothing when the airspace is calm.
 #[component]
-pub fn Status(
-    meta: RwSignal<Option<Meta>>,
-    picture: RwSignal<Option<PictureResponse>>,
-    conn: RwSignal<Conn>,
-    selected: RwSignal<Option<String>>,
-) -> impl IntoView {
-    let body = move || {
-        // The "server unreachable" state takes precedence over the Server's own
-        // health (which we can't trust once we can't reach it).
-        let (state_label, state_color, error) = match conn.get() {
-            Conn::Down(e) => ("UNREACHABLE", COL_PACING, Some(e)),
-            Conn::Connecting => ("CONNECTING", COL_HOME, None),
-            Conn::Ok => match picture.get() {
-                Some(p) => match p.health {
-                    Health::Live => ("LIVE", COL_APPROACH, None),
-                    Health::Stale => ("STALE", COL_HOME, p.last_error.clone()),
-                    Health::NoData => ("NO DATA", COL_PACING, p.last_error.clone()),
-                },
-                None => ("NO DATA", COL_PACING, None),
-            },
-        };
+pub fn MasterWarning(picture: RwSignal<Option<PictureResponse>>) -> impl IntoView {
+    move || {
+        picture.with(|p| {
+            p.as_ref().and_then(|p| {
+                any_emergency(&p.tracks).map(|f| {
+                    let sq = f
+                        .squawk
+                        .clone()
+                        .map(|s| format!(" · {s}"))
+                        .unwrap_or_default();
+                    let kind = f.emergency.clone().unwrap_or_default();
+                    view! {
+                        <div class="master-warning">
+                            {format!("⚠ EMERGENCY · {} · {kind}{sq}", label(f))}
+                        </div>
+                    }
+                })
+            })
+        })
+    }
+}
 
-        let source = meta
-            .get()
-            .map(|m| m.source)
-            .unwrap_or_else(|| "—".into());
-        let relevance = meta
-            .get()
-            .map(|m| format!("{:.0}nm", m.relevance_nm))
-            .unwrap_or_else(|| "—".into());
-
-        let pic = picture.get();
-        let tracks = pic
-            .as_ref()
-            .map(|p| p.tracks.clone())
-            .unwrap_or_default();
-        let count = tracks.len();
-        let age = pic
-            .as_ref()
-            .and_then(|p| p.snapshot_age_s)
-            .map(|s| format!("{s:.0}s ago"))
-            .unwrap_or_else(|| "—".into());
-        let nearest = tracks
-            .first()
-            .map(fmt_position)
-            .unwrap_or_else(|| "(none)".into());
-        let pacing_hex = pic.as_ref().and_then(|p| p.pacing_hex.clone());
-        let pacing = pacing_hex
-            .as_deref()
-            .and_then(|h| tracks.iter().find(|t| t.hex == h))
-            .map(fmt_pacing)
-            .unwrap_or_else(|| "quiet — backing off".into());
-
-        let selected_line = selected
-            .get()
-            .as_deref()
-            .and_then(|h| tracks.iter().find(|t| t.hex == h))
-            .map(|t| {
-                let model = t
-                    .model
-                    .as_deref()
-                    .or(t.aircraft_type.as_deref())
-                    .unwrap_or("unknown type");
-                format!(
-                    "sel {} · {model}  {:.3}, {:.3}  ({:.0}s old)",
-                    label(t),
-                    t.lat,
-                    t.lon,
-                    t.age_s
-                )
-            });
-
-        let last_line = match selected_line {
-            Some(s) => view! { <div class="status-line sel">{s}</div> }.into_any(),
-            None => view! {
-                <div class="status-line hint">
-                    "click a flight · ↑/↓ select · Enter detail · Esc clear"
-                </div>
-            }
-            .into_any(),
-        };
-
-        view! {
-            <div class="status-line">
-                "source " <b>{source}</b> "  "
-                <span class="state" style=format!("color:{state_color}")>
-                    {format!("[{state_label}]")}
-                </span>
-                {format!("  {count} flights · {age}")}
-            </div>
-            <div class="status-line">{format!("nearest  {nearest}")}</div>
-            <div class="status-line">{format!("pacing   {pacing}")}</div>
-            <div class="status-line">{format!("relevance {relevance}")}</div>
-            {last_line}
-            {error.map(|e| view! { <div class="status-line err">{format!("! {e}")}</div> })}
-        }
-    };
-
-    view! {
-        <div class="panel status-pane">
-            <div class="panel-title">"status"</div>
-            <div class="status-body">{body}</div>
-        </div>
+/// The connection/health badge text + CSS class for the title bar. "Server
+/// unreachable" takes precedence over the Server's own health (which we can't trust
+/// once we can't reach it).
+fn conn_state(conn: Conn, pic: Option<PictureResponse>) -> (&'static str, &'static str) {
+    match conn {
+        Conn::Down(_) => ("UNREACHABLE", "warn"),
+        Conn::Connecting => ("CONNECTING", "info"),
+        Conn::Ok => match pic.map(|p| p.health) {
+            Some(Health::Live) => ("LIVE", "ok"),
+            Some(Health::Stale) => ("STALE", "caution"),
+            _ => ("NO DATA", "warn"),
+        },
     }
 }

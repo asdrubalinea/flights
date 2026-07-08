@@ -18,8 +18,7 @@ use flights_api::{FlightDetail, Meta, PictureResponse};
 
 use crate::client::ApiClient;
 use crate::config::WebConfig;
-use crate::detail::DetailOverlay;
-use crate::panel::{FlightList, Status};
+use crate::panel::{Console, MasterWarning};
 use crate::radar::Radar;
 
 /// Whether the last `/picture` poll reached the Server. `Down` is the "server
@@ -56,6 +55,8 @@ pub fn App() -> impl IntoView {
     let cfg = WebConfig::from_location();
     let frame = Duration::from_millis(u64::from(cfg.frame_ms()));
     let client = ApiClient::new(cfg.server_url.clone());
+    // The CRT overlay (ADR-0009) is a class on the root, toggled by `?crt=` (default on).
+    let root_class = if cfg.crt { "app crt" } else { "app" };
 
     let meta = RwSignal::new(None::<Meta>);
     let picture = RwSignal::new(None::<PictureResponse>);
@@ -196,13 +197,19 @@ pub fn App() -> impl IntoView {
     }
 
     view! {
-        <div class="app">
+        <div class=root_class>
             <Radar meta=meta picture=picture selected=selected />
-            <div class="side">
-                <FlightList picture=picture selected=selected open=open />
-                <Status meta=meta picture=picture conn=conn selected=selected />
-            </div>
-            <DetailOverlay mode=mode detail=detail close=close />
+            <Console
+                meta=meta
+                picture=picture
+                conn=conn
+                selected=selected
+                mode=mode
+                detail=detail
+                open=open
+                close=close
+            />
+            <MasterWarning picture=picture />
         </div>
     }
 }

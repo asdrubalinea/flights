@@ -1,113 +1,174 @@
-//! The flight-detail overlay: a modal that renders the lazily-fetched
-//! [`FlightDetail`] for the selected flight — the promoted typed fields grouped
-//! under "Position & motion" / "Transponder", then the Server-contributed opaque
-//! [`DetailGroup`]s rendered verbatim (ADR-0004), exactly as the TUI popup does.
-//! Shows "flight left the area" once the flight drops out of the Picture or the
-//! fetch 404s, and an error notice if the fetch failed — never fabricated values.
+//! The in-console DETAIL page (ADR-0009 — no floating modal). A purpose-built Airbus
+//! glass-cockpit **instrument cluster** for the selected flight, built only from data
+//! ADS-B carries (ALT/VS/GS/TRK/FL, position, CPA, squawk) — no artificial horizon,
+//! airspeed, or engine pages, because we have no attitude, airspeed, or systems data
+//! (CONTEXT.md, *Observed kinematics*). The gauges read the *live* Picture track so
+//! they update each poll; the opaque, Server-formatted [`DetailGroup`]s (ADR-0004)
+//! come from the one-shot `/flight` fetch. A lost flight's gauges are flagged STALE
+//! (amber), never fabricated; once it leaves the Picture the page says so.
 
 use leptos::prelude::*;
 
-use flights_api::{FlightDetail, VerticalTrend};
+use flights_api::{ContactState, Flight, FlightDetail, PictureResponse};
 
-use crate::app::{DetailView, Mode};
-use crate::display::{label, trend_glyph};
+use crate::app::DetailView;
+use crate::display::{flight_level, label, trend_glyph};
 
-#[component]
-pub fn DetailOverlay(
-    mode: RwSignal<Mode>,
+/// The DETAIL page: a live instrument cluster (from the Picture track, so it updates
+/// each poll) above the opaque detail groups (from the one-shot `/flight` fetch). The
+/// gauges' closure tracks `picture`/`selected` and the groups' closure tracks
+/// `detail`, so the console body only re-runs on a `Mode` change.
+pub fn detail_page(
+    picture: RwSignal<Option<PictureResponse>>,
+    selected: RwSignal<Option<String>>,
     detail: RwSignal<Option<DetailView>>,
     close: Callback<()>,
-) -> impl IntoView {
-    move || {
-        if mode.get() != Mode::Detail {
-            return None;
-        }
-        let body = match detail.get() {
-            Some(DetailView::Loaded(d)) => detail_body(&d),
-            Some(DetailView::LeftArea) => notice("— flight left the area —"),
-            Some(DetailView::Error(e)) => notice(&format!("— {e} —")),
-            _ => notice("— loading… —"),
-        };
-        Some(view! {
-            // Click the dimmed backdrop to close; clicks inside the modal don't
-            // bubble up to it.
-            <div class="overlay" on:click=move |_| close.run(())>
-                <div class="modal" on:click=move |ev| ev.stop_propagation()>
-                    <div class="modal-title">
-                        <span>"flight detail"</span>
-                        <button class="modal-close" on:click=move |_| close.run(())>"×"</button>
-                    </div>
-                    <div class="modal-body">{body}</div>
-                    <div class="modal-footer">"Esc close · ↑/↓ flight"</div>
-                </div>
-            </div>
+) -> AnyView {
+    // The selected flight's *live* track from the current Picture (re-derived each
+    // poll, so the gauges update). `None` once it has left the Picture.
+    let live = move || {
+        selected.get().and_then(|h| {
+            picture.with(|p| {
+                p.as_ref()
+                    .and_then(|p| p.tracks.iter().find(|t| t.hex == h).cloned())
+            })
         })
+    };
+
+    let gauges = move || match live() {
+        Some(f) => instrument_cluster(&f),
+        None => view! { <div class="d-notice">"— flight left the area —"</div> }.into_any(),
+    };
+    let groups = move || match detail.get() {
+        Some(DetailView::Loaded(d)) => identity_groups(&d),
+        Some(DetailView::Error(e)) => notice(&format!("— detail unavailable: {e} —")),
+        Some(DetailView::Loading) | None => notice("— loading detail… —"),
+        Some(DetailView::LeftArea) => Vec::new(), // the cluster already says so
+    };
+
+    view! {
+        <div class="detail-page">
+            <div class="detail-body">
+                {gauges}
+                {groups}
+            </div>
+            <button class="lsk-back" on:click=move |_| close.run(())>"◂ RADAR"</button>
+        </div>
     }
+    .into_any()
 }
 
-/// Every displayable field for one flight: a header, the promoted typed fields
-/// grouped under section headings, then the opaque Server-formatted groups.
-fn detail_body(d: &FlightDetail) -> Vec<AnyView> {
+/// The instrument cluster — GS / ALT+FL / V/S / TRK gauges, then position, CPA, geo
+/// altitude, and transponder lines. Only fields ADS-B carries; a lost track is
+/// flagged STALE (amber) rather than faked (CONTEXT.md, *Observed kinematics*).
+fn instrument_cluster(f: &Flight) -> AnyView {
+    let stale = f.state != ContactState::InContact;
+    let gauge_class = if stale { "gauge stale" } else { "gauge" };
+
+    let gs = f
+        .groundspeed_kt
+        .map(|g| format!("{g:.0}"))
+        .unwrap_or_else(|| "---".into());
+    let alt = f
+        .altitude_ft
+        .map(|a| format!("{a:.0}"))
+        .unwrap_or_else(|| "-----".into());
+    let fl = f.altitude_ft.map(flight_level).unwrap_or_default();
+    let vs = f
+        .vertical_rate_fpm
+        .map(|v| format!("{v:+.0}"))
+        .unwrap_or_else(|| "----".into());
+    let (vglyph, _) = trend_glyph(f.vertical_trend);
+    let trk = f
+        .track_deg
+        .map(|t| format!("{t:03.0}"))
+        .unwrap_or_else(|| "---".into());
+
+    let pos = format!("{:.1} nm  {:03.0}°", f.distance_nm, f.bearing_deg);
+    let geo = f
+        .geometric_altitude_ft
+        .map(|a| format!("{a:.0} ft"))
+        .unwrap_or_else(|| "—".into());
+    let cpa = match &f.cpa {
+        Some(c) if c.time_to_cpa_s >= 0.0 => {
+            format!("{:.1} nm in {:.0}s", c.cpa_distance_nm, c.time_to_cpa_s)
+        }
+        Some(_) => "receding".into(),
+        None => "—".into(),
+    };
+    let squawk = f.squawk.clone().unwrap_or_else(|| "----".into());
+    let kind = f
+        .aircraft_type
+        .clone()
+        .or_else(|| f.model.clone())
+        .unwrap_or_default();
+
+    view! {
+        <div class="cluster">
+            <div class="cluster-head">
+                <span class="ci">{label(f)}</span>
+                <span class="ck">{kind}</span>
+                {stale.then(|| view! { <span class="cstale">"STALE"</span> })}
+            </div>
+            <div class="gauges">
+                <div class=gauge_class>
+                    <div class="glabel">"GS"</div>
+                    <div class="gval">{gs}</div>
+                    <div class="gunit">"kt"</div>
+                </div>
+                <div class=gauge_class>
+                    <div class="glabel">"ALT"</div>
+                    <div class="gval">{alt}</div>
+                    <div class="gunit">{fl}</div>
+                </div>
+                <div class=gauge_class>
+                    <div class="glabel">"V/S"</div>
+                    <div class="gval">{vs}</div>
+                    <div class="gunit">{format!("fpm {vglyph}")}</div>
+                </div>
+                <div class=gauge_class>
+                    <div class="glabel">"TRK"</div>
+                    <div class="gval">{trk}</div>
+                    <div class="gunit">"°T"</div>
+                </div>
+            </div>
+            <div class="gauge-lines">
+                <div class="gline"><span class="k">"POS  "</span>{pos}</div>
+                <div class="gline"><span class="k">"CPA  "</span>{cpa}</div>
+                <div class="gline"><span class="k">"GEO  "</span>{geo}</div>
+                <div class="gline">
+                    <span class="k">"XPDR "</span>
+                    {squawk}
+                    {f
+                        .emergency
+                        .as_ref()
+                        .map(|e| view! { <span class="cemer">{format!("  EMER {e}")}</span> })}
+                </div>
+            </div>
+        </div>
+    }
+    .into_any()
+}
+
+/// Identity (registration / operator / category) followed by the opaque,
+/// Server-formatted detail groups, rendered verbatim (ADR-0004).
+fn identity_groups(d: &FlightDetail) -> Vec<AnyView> {
     let f = &d.flight;
     let mut out: Vec<AnyView> = Vec::new();
 
-    out.push(view! { <div class="d-header">{label(f)}</div> }.into_any());
-
-    if let Some(r) = &f.registration {
-        out.push(field("Registration", r));
-    }
-    if let Some(o) = &f.operator {
-        out.push(field("Operator", o));
-    }
-    let kind = match (&f.aircraft_type, &f.model) {
-        (Some(ty), Some(m)) => Some(format!("{ty} · {m}")),
-        (Some(ty), None) => Some(ty.clone()),
-        (None, Some(m)) => Some(m.clone()),
-        (None, None) => None,
-    };
-    if let Some(k) = kind {
-        out.push(field("Type", &k));
-    }
-    if let Some(c) = &f.emitter_category {
-        out.push(field("Category", c));
-    }
-
-    out.push(section("Position & motion"));
-    out.push(field("Distance", &format!("{:.1} nm", f.distance_nm)));
-    out.push(field("Bearing", &format!("{:03.0}°", f.bearing_deg)));
-    if let Some(a) = f.altitude_ft {
-        out.push(field("Baro alt", &format!("{a:.0} ft")));
-    }
-    if let Some(a) = f.geometric_altitude_ft {
-        out.push(field("Geo alt", &format!("{a:.0} ft")));
-    }
-    if let Some(r) = f.vertical_rate_fpm {
-        let (glyph, _) = trend_glyph(f.vertical_trend);
-        out.push(field("Vertical rate", &format!("{r:+.0} fpm {glyph}")));
-    } else if f.vertical_trend != VerticalTrend::Unknown {
-        let (glyph, _) = trend_glyph(f.vertical_trend);
-        out.push(field("Vertical trend", glyph));
-    }
-    if let Some(g) = f.groundspeed_kt {
-        out.push(field("Groundspeed", &format!("{g:.0} kt")));
-    }
-    if let Some(tr) = f.track_deg {
-        out.push(field("Track", &format!("{tr:03.0}°")));
-    }
-    out.push(field("Position", &format!("{:.4}, {:.4}", f.lat, f.lon)));
-    out.push(field("Position age", &format!("{:.0}s", f.age_s)));
-
-    if f.squawk.is_some() || f.emergency.is_some() {
-        out.push(section("Transponder"));
-        if let Some(s) = &f.squawk {
-            out.push(field("Squawk", s));
+    if f.registration.is_some() || f.operator.is_some() || f.emitter_category.is_some() {
+        out.push(section("Identity"));
+        if let Some(r) = &f.registration {
+            out.push(field("Registration", r));
         }
-        if let Some(e) = &f.emergency {
-            out.push(field("Emergency", e));
+        if let Some(o) = &f.operator {
+            out.push(field("Operator", o));
+        }
+        if let Some(c) = &f.emitter_category {
+            out.push(field("Category", c));
         }
     }
 
-    // The opaque, Server-formatted detail groups — rendered verbatim.
     for group in &d.details {
         out.push(section(&group.title));
         for fld in &group.fields {

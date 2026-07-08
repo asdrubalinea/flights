@@ -88,15 +88,80 @@
           ];
           text = builtins.readFile ./scripts/flights-web;
         };
+
+        # `nix build .#web-dist` — the webclient as a *built static bundle*, not a
+        # launcher. Trunk compiles ./flights-web to wasm at build time and emits the
+        # deployable directory (index.html + hashed wasm/js + style.css + the B612
+        # fonts) into `./result`. Drop that behind any static file server — it is a
+        # pure Client (ADR-0005/0007): it renders and reads the Server's REST API
+        # cross-origin, so wherever it is served, that origin must appear in the
+        # Server's `cors_allow_origin` (the `serve-web` HM option below wires this up
+        # automatically). Point the page at a Server with `?server=http://host:port`.
+        #
+        # This reuses `flights`'s `cargoLock` vendoring so the wasm crates build with
+        # no network, then hands the build to Trunk. Trunk's own tool fetch is the
+        # one thing that would reach out — `--offline` forbids it and Trunk instead
+        # takes `wasm-bindgen` (version-matched to the `=0.2.121` crate pin) and
+        # `wasm-opt` (binaryen) straight off the build PATH.
+        web-dist = rustPlatform.buildRustPackage {
+          pname = "flights-web-dist";
+          version = workspace.package.version;
+          src = pkgs.lib.cleanSource ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+
+          nativeBuildInputs = [
+            pkgs.trunk
+            pkgs.wasm-bindgen-cli # must match the pinned wasm-bindgen crate
+            # wasm-opt, for Trunk's release minification. rustc emits the finished
+            # wasm proposals (bulk-memory, sign-ext, …) by default, but binaryen 129
+            # won't auto-enable them when optimizing and rejects its own input. A
+            # thin wrapper turns them on so `-O` validates; `--version` (Trunk's
+            # discovery probe) still reports plain "129", so Trunk accepts it offline.
+            (pkgs.writeShellScriptBin "wasm-opt" ''
+              exec ${pkgs.binaryen}/bin/wasm-opt \
+                --enable-bulk-memory \
+                --enable-sign-ext \
+                --enable-nontrapping-float-to-int \
+                --enable-mutable-globals \
+                --enable-reference-types \
+                --enable-multivalue \
+                "$@"
+            '')
+          ];
+
+          # Trunk drives the wasm build and the asset pipeline, so replace
+          # buildRustPackage's default cargo build/check/install with one Trunk run.
+          # The cargoLock setup hook still runs in configurePhase, vendoring deps and
+          # pointing cargo (which Trunk shells out to) at the offline registry.
+          buildPhase = ''
+            runHook preBuild
+            # Run from the crate dir (mirroring ./scripts/flights-web): the root
+            # Cargo.toml is a *virtual* workspace, so Trunk must see flights-web's own
+            # package manifest to resolve the target crate.
+            cd flights-web
+            trunk build --release --offline --dist "$out" index.html
+            runHook postBuild
+          '';
+          dontCargoBuild = true;
+          doCheck = false;
+          dontCargoCheck = true;
+          installPhase = "true"; # Trunk already wrote the bundle to $out
+
+          meta = {
+            description = "flights radar webclient, compiled to a static wasm bundle (ADR-0007)";
+          };
+        };
       in
       {
         # `nix build` / `nix build .#flights` -> ./result/bin/{flights,flights-server,flights-waybar}
         # `nix build .#radar`                 -> ./result/bin/flights-radar
+        # `nix build .#web-dist`              -> ./result (static webclient bundle)
         packages = {
           default = flights;
           flights = flights;
           radar = radar;
           web = web;
+          web-dist = web-dist;
         };
 
         # `nix run` (the TUI alone), `nix run .#radar` (Server + TUI together),
@@ -201,6 +266,58 @@
                 there to your location.
               '';
             };
+
+            # Serve the compiled webclient beside the always-on Server. The bundle is
+            # a pure static Client (ADR-0005/0007) — `static-web-server` just hands
+            # out the files; all state lives in the Server it reads cross-origin. So
+            # enabling this also opts the Server into the page's origin over CORS
+            # (see `config` below), mirroring what `nix run .#web` does per-run.
+            web = {
+              enable = lib.mkEnableOption (
+                "serving the compiled radar webclient (the .#web-dist bundle) over a "
+                + "static-web-server user service, with the Server's CORS wired to match"
+              );
+
+              package = lib.mkOption {
+                type = lib.types.package;
+                default = self.packages.${pkgs.system}.web-dist;
+                defaultText = lib.literalExpression "flights.packages.\${system}.web-dist";
+                description = ''
+                  The built static webclient bundle to serve — Trunk's `dist/` output
+                  (wasm + js + css + fonts), not a binary.
+                '';
+              };
+
+              address = lib.mkOption {
+                type = lib.types.str;
+                default = "127.0.0.1";
+                description = ''
+                  Address `static-web-server` binds. Loopback by default; set to
+                  `0.0.0.0` to reach the page from the LAN (then set `corsOrigin` to
+                  the host the browser actually uses — `address` is a bind address,
+                  not a browser origin).
+                '';
+              };
+
+              port = lib.mkOption {
+                type = lib.types.port;
+                default = 8080;
+                description = "Port `static-web-server` serves the webclient on.";
+              };
+
+              corsOrigin = lib.mkOption {
+                type = lib.types.str;
+                default = "http://127.0.0.1:${toString cfg.web.port}";
+                defaultText = lib.literalExpression ''"http://127.0.0.1:''${toString port}"'';
+                description = ''
+                  The browser origin the Server must allow so the page's cross-origin
+                  reads aren't blocked. Appended to the Server as
+                  `--cors-allow-origin`. Defaults to the loopback origin `port`
+                  produces; override when the page is reached over the LAN or a
+                  reverse proxy.
+                '';
+              };
+            };
           };
 
           config = lib.mkIf cfg.enable {
@@ -225,8 +342,46 @@
                     "${cfg.package}/bin/flights-server"
                     "--serve"
                   ]
+                  # Opt the Server into the served page's origin (CORS is off by
+                  # default — ADR-0005/0007). `extraArgs` follows, so a user's own
+                  # --cors-allow-origin there still stacks.
+                  ++ lib.optionals cfg.web.enable [
+                    "--cors-allow-origin"
+                    cfg.web.corsOrigin
+                  ]
                   ++ cfg.extraArgs
                 );
+                Restart = "on-failure";
+                RestartSec = 3;
+              };
+              Install.WantedBy = [ "graphical-session.target" ];
+            };
+
+            # The static webclient, served beside the Server when `web.enable`. Like
+            # the Server it lives in the graphical session and needs no root; it only
+            # hands out files, so it never touches the Source and can't threaten the
+            # single-poller invariant. Ordered `After` the Server purely for tidy
+            # startup — the page tolerates a not-yet-ready Server (it shows
+            # UNREACHABLE and retries), so this is not a hard dependency.
+            systemd.user.services.flights-web = lib.mkIf cfg.web.enable {
+              Unit = {
+                Description = "flights radar webclient (static bundle over static-web-server)";
+                PartOf = [ "graphical-session.target" ];
+                After = [
+                  "graphical-session.target"
+                  "flights-server.service"
+                ];
+              };
+              Service = {
+                ExecStart = lib.escapeShellArgs [
+                  "${pkgs.static-web-server}/bin/static-web-server"
+                  "--root"
+                  "${cfg.web.package}"
+                  "--host"
+                  cfg.web.address
+                  "--port"
+                  (toString cfg.web.port)
+                ];
                 Restart = "on-failure";
                 RestartSec = 3;
               };
